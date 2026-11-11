@@ -37,10 +37,60 @@ def prepare(checkout):
     source = checkout / 'windows/coda/CODA/CODA.cpp'
     text = source.read_text()
     reference = (ROOT / 'upstream-reference/CODA.cpp').read_text()
-    if text not in (reference, patch_identity(reference)):
+    if text not in (reference, patch_native_ui(reference)):
         raise ValueError('Refusing to overwrite other edits to CODA.cpp')
-    source.write_text(patch_identity(text))
+    source.write_text(patch_native_ui(text))
+    backstage = checkout / 'browser/src/control/Control.BackstageView.ts'
+    original = (ROOT / 'upstream-reference/Control.BackstageView.ts').read_text()
+    current = backstage.read_text()
+    if current not in (original, patch_backstage(original)):
+        raise ValueError('Refusing to overwrite other edits to BackstageView')
+    backstage.write_text(patch_backstage(current))
     return head
+
+def patch_native_ui(text):
+    native = patch_identity(text)
+    if '&officeflowApp=' not in native:
+        needle = '                        coolURL += "&lang=" + uiLanguage;'
+        if native.count(needle) != 1:
+            raise ValueError('Upstream document URL changed')
+        native = native.replace(needle, '                        coolURL += "&officeflowApp=" + officeFlowAppName;\n' + needle)
+    for old, new in [('odt', 'docx'), ('ods', 'xlsx'), ('odp', 'pptx')]:
+        needle = 'templateExtension = L"' + old + '";'
+        replacement = 'templateExtension = L"' + new + '";'
+        if replacement not in native:
+            if native.count(needle) != 1:
+                raise ValueError('Upstream blank document template changed')
+            native = native.replace(needle, replacement)
+    return native
+
+def patch_backstage(text):
+    marker = '// OfficeFlow keeps each application on its own document family.'
+    if marker in text:
+        return text
+    anchor = 'class BackstageView extends window.L.Class {'
+    if text.count(anchor) != 1:
+        raise ValueError('Upstream BackstageView changed')
+    text = text.replace(anchor, anchor + '''
+    // OfficeFlow keeps each application on its own document family.
+    private readonly officeFlowType: TemplateType | null =
+        ({WordFlow: 'writer', CellFlow: 'calc', SlideFlow: 'impress'} as Record<string, TemplateType>)[
+            new URLSearchParams(window.location.search).get('officeflowApp') || ''
+        ] || null;
+''')
+    blank = "\t\t\t\t\tthis.getBlankTemplate('draw'),\n\t\t\t\t],"
+    if text.count(blank) != 1:
+        raise ValueError('Upstream home template list changed')
+    text = text.replace(blank, "\t\t\t\t\tthis.getBlankTemplate('draw'),\n\t\t\t\t].filter(t => t && (!this.officeFlowType || t.type === this.officeFlowType)),")
+    types = "return (['writer', 'calc', 'impress', 'draw'] as TemplateType[]).map("
+    if text.count(types) != 1:
+        raise ValueError('Upstream new document types changed')
+    text = text.replace(types, "return (['writer', 'calc', 'impress', 'draw'] as TemplateType[]).filter(t => !this.officeFlowType || t === this.officeFlowType).map(")
+    text = text.replace('.filter(Boolean);', '.filter(Boolean)\n            .filter(t => !this.officeFlowType || t.type === this.officeFlowType);')
+    condition = "(this.templateFilter === 'all' ||"
+    if text.count(condition) != 1:
+        raise ValueError('Upstream template filtering changed')
+    return text.replace(condition, "(!this.officeFlowType || template.type === this.officeFlowType) &&\n                " + condition)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

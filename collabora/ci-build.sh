@@ -29,8 +29,10 @@ JOM=/c/of-tools/bin/jom.exe
 EOF
 cd "$build_dir"
 "$source_dir/windows/coda/build/autogen.sh" 2>&1 | tee configure.log
-make CONFIG=Release APP_NAME=OfficeFlow VENDOR=Hasbreo INFO_URL=https://hasbreo.com/officeflow/ 2>&1 | tee build.log
+make CONFIG=Release APP_NAME=OfficeFlow VENDOR=Hasbreo INFO_URL=https://hasbreo.com/officeflow/ ONLINE_CONFIGURE_ARGS="--with-app-branding=$repo/collabora/branding" 2>&1 | tee build.log
 native="$build_dir/online/windows/coda/x64/Release/program"
 test -s "$native/OfficeFlow.exe"
 for app in WordFlow CellFlow SlideFlow; do cp "$native/OfficeFlow.exe" "$native/$app.exe"; done
+mkdir -p "$native/../templates"
+cp "$repo/collabora/templates/"* "$native/../templates/"
 echo 'Native development build completed. Installer and release validation are separate gates.'

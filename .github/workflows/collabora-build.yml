@@ -1,6 +1,7 @@
 name: Build Collabora native editors
 on:
   push:
+    branches: [main]
     paths: ['.github/workflows/collabora-build.yml', 'collabora/**']
   workflow_dispatch:
 permissions:

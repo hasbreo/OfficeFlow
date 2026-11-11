@@ -20,5 +20,28 @@ class NativeIdentityPatch(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.patch_identity('unrecognised startup implementation')
 
+    def test_native_ui_patch_is_repeatable_and_uses_office_formats(self):
+        original = (root / 'upstream-reference/CODA.cpp').read_text()
+        patched = module.patch_native_ui(original)
+        self.assertEqual(patched, module.patch_native_ui(patched))
+        self.assertIn('&officeflowApp=', patched)
+        for ext in ['docx', 'xlsx', 'pptx']:
+            self.assertIn('templateExtension = L"' + ext + '";', patched)
+
+    def test_start_pages_keep_only_the_app_document_family(self):
+        original = (root / 'upstream-reference/Control.BackstageView.ts').read_text()
+        patched = module.patch_backstage(original)
+        self.assertEqual(patched, module.patch_backstage(patched))
+        self.assertIn('officeFlowType', patched)
+        for action in ['executePrint()', 'executeSave()', 'executeSaveAs()', 'executeOptions()']:
+            self.assertEqual(original.count(action), patched.count(action))
+
+    def test_blank_packages_are_valid_office_files(self):
+        import zipfile
+        for filename, part in [('TextDocument.docx','word/document.xml'),('Spreadsheet.xlsx','xl/workbook.xml'),('Presentation.pptx','ppt/presentation.xml')]:
+            with zipfile.ZipFile(root / 'templates' / filename) as package:
+                self.assertIn(part, package.namelist())
+                self.assertIn('[Content_Types].xml', package.namelist())
+
 if __name__ == '__main__':
     unittest.main()
