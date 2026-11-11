@@ -15,7 +15,7 @@ const fixtures=[['writer','TextDocument.odt','text'],['calc','Spreadsheet.ods','
   await fs.copyFile(path.join(root,'templates',template),doc);
   await fs.mkdir(profile,{recursive:true});
   const child=spawn(executable,[doc],{cwd:path.dirname(executable),env:{...process.env,CODA_TEST_DATA_DIR:profile,CODA_TEST_REMOTE_DEBUGGING_PORT:String(port),CODA_LOGLEVEL:'warning'},stdio:'ignore'});
-  let browser;
+  let browser,page;
   try{
    const until=Date.now()+90000;
    while(Date.now()<until){
@@ -23,7 +23,6 @@ const fixtures=[['writer','TextDocument.odt','text'],['calc','Spreadsheet.ods','
     try{browser=await chromium.connectOverCDP('http://127.0.0.1:'+port);break;}catch{await new Promise(r=>setTimeout(r,1000));}
    }
    assert(browser,kind+' did not expose its test debugging endpoint');
-   let page;
    while(Date.now()<until){
     page=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url().includes('cool.html'));
     if(page)break;
@@ -37,7 +36,7 @@ const fixtures=[['writer','TextDocument.odt','text'],['calc','Spreadsheet.ods','
    // Existing files open in Viewing mode. Exercise the real mode chooser first.
    await page.getByText('Viewing',{exact:true}).click();
    await fs.writeFile('probe-results/'+kind+'-mode-menu.txt',await page.locator('body').innerText());
-   await page.getByText('Editing',{exact:true}).click();
+   await page.getByText('Editing Mode',{exact:true}).click();
    await page.waitForFunction(()=>app.map.isEditMode(),{timeout:30000});
    await page.waitForFunction(()=>document.querySelector('#notebookbar, .notebookbar'),{timeout:30000});
    const xmlBefore=strFromU8(unzipSync(await fs.readFile(doc))['content.xml']);
@@ -68,6 +67,12 @@ const fixtures=[['writer','TextDocument.odt','text'],['calc','Spreadsheet.ods','
    await page.screenshot({path:'probe-results/'+kind+'.png',fullPage:false});
    await fs.writeFile('probe-results/'+kind+'.txt',await page.locator('body').innerText());
    console.log(kind+' native editor rendered, entered Editing mode and saved real content PASS');
+  }catch(error){
+   if(page){
+    await page.screenshot({path:'probe-results/'+kind+'-failure.png'}).catch(()=>{});
+    await fs.writeFile('probe-results/'+kind+'-failure.txt',await page.locator('body').innerText()).catch(()=>{});
+   }
+   throw error;
   }finally{
    if(browser)await browser.close();
    spawn('taskkill',['/PID',String(child.pid),'/T','/F'],{stdio:'ignore'});
