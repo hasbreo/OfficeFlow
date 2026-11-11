@@ -1,0 +1,27 @@
+name: Collabora Windows toolchain
+on:
+  push:
+    paths: ['.github/workflows/collabora-windows.yml', 'collabora/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  toolchain:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 15
+    steps:
+      - name: Inspect Windows native build resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, OSArchitecture, TotalVisibleMemorySize
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          & $vswhere -latest -products '*' -format json
+          & $vswhere -latest -products '*' -find 'VC\Tools\Llvm\x64\bin\clang-cl.exe'
+          foreach ($tool in @('git','node','python','winget','choco','msbuild')) {
+            Get-Command $tool -ErrorAction SilentlyContinue | Select-Object Name, Source
+          }
+          if (-not (& $vswhere -latest -products '*' -find 'VC\Tools\Llvm\x64\bin\clang-cl.exe')) {
+            throw 'ClangCL missing from runner'
+          }
