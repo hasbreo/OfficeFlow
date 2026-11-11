@@ -3,9 +3,12 @@ set -euo pipefail
 repo=$(pwd)
 source_dir=/c/of-source
 build_dir=/c/of-build
-mkdir -p /c/of-temp
+mkdir -p /c/of-temp /c/tmp
 # Native make cannot interpret MSYS2's default /tmp as a Windows filesystem path.
 export TMPDIR=C:/of-temp TMP=C:/of-temp TEMP=C:/of-temp
+# Some native make builds fall back to /tmp (a drive-root path on Windows).
+# Keep that fallback on this disposable runner and verify stdin makefiles early.
+printf 'all:;@echo native-make-stdin-ok\n' | /c/of-tools/bin/make.exe -f -
 commit=$(python -c 'import json; print(json.load(open("collabora/upstream.lock.json"))["commit"])')
 git -c core.autocrlf=false init "$source_dir"
 git -C "$source_dir" remote add origin https://github.com/CollaboraOnline/online.mirror.git

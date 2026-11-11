@@ -46,6 +46,13 @@ def prepare(checkout):
     if current not in (original, patch_backstage(original)):
         raise ValueError('Refusing to overwrite other edits to BackstageView')
     backstage.write_text(patch_backstage(current))
+    types = checkout / 'browser/src/control/backstage/Types.ts'
+    original_types = (ROOT / 'upstream-reference/Types.ts').read_text()
+    current_types = types.read_text()
+    patched_types = original_types.replace("\t\t| 'quit';", "\t\t| 'checkupdates'\n\t\t| 'quit';")
+    if current_types not in (original_types, patched_types):
+        raise ValueError('Refusing to overwrite other edits to backstage types')
+    types.write_text(patched_types)
     return head
 
 def patch_native_ui(text):
@@ -62,6 +69,46 @@ def patch_native_ui(text):
             if native.count(needle) != 1:
                 raise ValueError('Upstream blank document template changed')
             native = native.replace(needle, replacement)
+    if '// OfficeFlow signed update bridge' not in native:
+        declaration = 'static std::string officeFlowAppName = "OfficeFlow";'
+        native = native.replace(declaration, declaration + '\nstatic void launchOfficeFlowUpdater(bool startup);')
+        entry = 'int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int showWindowMode)'
+        if native.count(entry) != 1:
+            raise ValueError('Upstream Windows entry point changed')
+        helper = '''// OfficeFlow signed update bridge: only a fixed installed executable is launched.
+static void launchOfficeFlowUpdater(bool startup)
+{
+    const auto helper = (std::filesystem::path(Util::string_to_wide_string(app_installation_path)) /
+                         L".." / L".." / L"OfficeFlowUpdater.exe").lexically_normal();
+    if (!std::filesystem::exists(helper))
+    {
+        if (!startup)
+            MessageBoxW(nullptr, L"The updater is not included in this development build.",
+                        L"OfficeFlow Updates", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    const wchar_t* flags = startup ? L"--update-helper --startup" : L"--update-helper";
+    const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(
+        nullptr, L"open", helper.c_str(), flags, helper.parent_path().c_str(), SW_SHOWNORMAL));
+    if (result <= 32 && !startup)
+        MessageBoxW(nullptr, L"Unable to start the OfficeFlow updater.",
+                    L"OfficeFlow Updates", MB_OK | MB_ICONERROR);
+}
+
+'''
+        native = native.replace(entry, helper + entry)
+        command = '        else if (s.starts_with(L"newdoc "))'
+        if native.count(command) != 1:
+            raise ValueError('Upstream native message handling changed')
+        native = native.replace(command, '''        else if (s == L"OFFICEFLOWCHECKUPDATES")
+        {
+            launchOfficeFlowUpdater(false);
+        }
+''' + command)
+        loop = '    MSG msg;\n    while (GetMessage(&msg, NULL, 0, 0))'
+        if native.count(loop) != 1:
+            raise ValueError('Upstream native event loop changed')
+        native = native.replace(loop, '    launchOfficeFlowUpdater(true);\n\n' + loop)
     return native
 
 def patch_backstage(text):
@@ -78,6 +125,16 @@ def patch_backstage(text):
             new URLSearchParams(window.location.search).get('officeflowApp') || ''
         ] || null;
 ''')
+    action = '\t\topen: () => this.executeOpen(),'
+    if text.count(action) != 1:
+        raise ValueError('Upstream File actions changed')
+    text = text.replace(action, action + "\n        checkupdates: () => window.postMobileMessage('OFFICEFLOWCHECKUPDATES'),")
+    tabs = '\tprivate getTabsConfig(): BackstageTabConfig[] {\n\t\treturn ['
+    if text.count(tabs) != 1:
+        raise ValueError('Upstream File menu changed')
+    text = text.replace(tabs, tabs + '''
+            { id: 'officeflow-updates', label: _('Check for updates'), type: 'action',
+              actionType: 'checkupdates', icon: 'lc_reload.svg', visible: true },''')
     blank = "\t\t\t\t\tthis.getBlankTemplate('draw'),\n\t\t\t\t],"
     if text.count(blank) != 1:
         raise ValueError('Upstream home template list changed')
