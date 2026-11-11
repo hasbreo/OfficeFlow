@@ -22,6 +22,10 @@ cat > "$build_dir/autogen.input" <<'EOF'
 --with-parallelism=2
 --without-junit
 PKG_CONFIG=/c/of-tools/bin/pkgconf-2.4.3.exe
+MAKE=/c/of-tools/bin/make.exe
+GNUMAKE=/c/of-tools/bin/make.exe
+JOM=/c/of-tools/bin/jom.exe
+--disable-symbols
 EOF
 cd "$build_dir"
 "$source_dir/windows/coda/build/autogen.sh" 2>&1 | tee configure.log
