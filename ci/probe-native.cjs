@@ -3,6 +3,7 @@
 const {chromium}=require('playwright');
 const {spawn}=require('node:child_process');
 const fs=require('node:fs/promises'),path=require('node:path'),assert=require('node:assert/strict');
+const {unzipSync,strFromU8}=require('fflate');
 const root=path.resolve(process.argv[2]);
 const executable=path.join(root,'program','Collabora Office Preview.exe');
 const fixtures=[['writer','TextDocument.odt','text'],['calc','Spreadsheet.ods','spreadsheet'],['impress','Presentation.odp','presentation']];
@@ -33,9 +34,40 @@ const fixtures=[['writer','TextDocument.odt','text'],['calc','Spreadsheet.ods','
    const type=await page.evaluate(()=>app.map._docLayer._docType);
    assert.equal(type,expected);
    await page.waitForFunction(()=>document.querySelector('#document-container canvas, .leaflet-tile-loaded, #map canvas'),{timeout:90000});
+   // Existing files open in Viewing mode. Exercise the real mode chooser first.
+   await page.getByText('Viewing',{exact:true}).click();
+   await fs.writeFile('probe-results/'+kind+'-mode-menu.txt',await page.locator('body').innerText());
+   await page.getByText('Editing',{exact:true}).click();
+   await page.waitForFunction(()=>app.map.isEditMode(),{timeout:30000});
+   await page.waitForFunction(()=>document.querySelector('#notebookbar, .notebookbar'),{timeout:30000});
+   const xmlBefore=strFromU8(unzipSync(await fs.readFile(doc))['content.xml']);
+   if(kind==='writer'){
+    await page.evaluate(()=>app.map.focus());
+    await page.keyboard.type('OfficeFlow native editing check');
+   }else if(kind==='calc'){
+    for(const[cell,value]of[['A1','8'],['B1','=A1*2']]){
+     await page.evaluate(cell=>app.map.sendUnoCommand('.uno:GoToCell',{ToPoint:{type:'string',value:cell}}),cell);
+     await page.evaluate(()=>app.map.focus());
+     await page.keyboard.type(value);await page.keyboard.press('Enter');
+    }
+   }else await page.evaluate(()=>app.map.insertPage());
+   await page.evaluate(()=>app.map.save(false,false));
+   const saveUntil=Date.now()+30000;
+   let saved=false;
+   while(Date.now()<saveUntil){
+    try{
+     const xml=strFromU8(unzipSync(await fs.readFile(doc))['content.xml']);
+     if(kind==='writer')saved=xml.includes('OfficeFlow native editing check');
+     else if(kind==='calc')saved=xml.includes('office:value="16"')&&xml.includes('table:formula=');
+     else saved=(xml.match(/<draw:page\s/g)||[]).length>(xmlBefore.match(/<draw:page\s/g)||[]).length;
+     if(saved)break;
+    }catch{}
+    await new Promise(r=>setTimeout(r,300));
+   }
+   assert(saved,kind+' edit did not survive native save');
    await page.screenshot({path:'probe-results/'+kind+'.png',fullPage:false});
    await fs.writeFile('probe-results/'+kind+'.txt',await page.locator('body').innerText());
-   console.log(kind+' native engine rendered '+expected+' PASS');
+   console.log(kind+' native editor rendered, entered Editing mode and saved real content PASS');
   }finally{
    if(browser)await browser.close();
    spawn('taskkill',['/PID',String(child.pid),'/T','/F'],{stdio:'ignore'});
