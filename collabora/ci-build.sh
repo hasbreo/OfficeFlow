@@ -6,6 +6,8 @@ build_dir=/c/of-build
 commit=$(python -c 'import json; print(json.load(open("collabora/upstream.lock.json"))["commit"])')
 git -c core.autocrlf=false init "$source_dir"
 git -C "$source_dir" remote add origin https://github.com/CollaboraOnline/online.mirror.git
+git -C "$source_dir" config core.symlinks true
+git -C "$source_dir" config core.autocrlf false
 git -C "$source_dir" -c core.autocrlf=false fetch --depth=1 origin "$commit"
 git -C "$source_dir" -c core.autocrlf=false checkout --detach FETCH_HEAD
 python "$repo/collabora/prepare.py" "$source_dir"

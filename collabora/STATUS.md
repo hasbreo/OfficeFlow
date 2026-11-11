@@ -12,12 +12,13 @@
 - Added Windows build entry point; source-level patch tests are distinct from
   compilation and application tests.
 
-## Blocker
+## Initial blocker (resolved by GitHub Actions)
 
 This executor is Linux with no native Windows/Visual Studio build runner.
 The official Windows host and engine require native MSBuild/ClangCL plus MSYS2.
-No accessible Windows runner has been established. A complete custom Windows
-installer has therefore NOT been built or published.
+The initial workspace had no Windows runner. GitHub Actions subsequently passed
+the VS 2026/ClangCL preflight, and the first native build is now configured in
+this repository. A complete custom Windows installer has NOT been built or published.
 
 ## Work required before release
 
