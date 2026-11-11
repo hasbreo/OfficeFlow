@@ -12,6 +12,7 @@ $make = Fetch-Checked 'https://gerrit.collaboraoffice.com/extern/make-4.4.1-msvc
 Copy-Item $make "$bin\make.exe"
 $pkgconf = Fetch-Checked 'https://gerrit.collaboraoffice.com/extern/pkgconf-2.4.3.exe' 'pkgconf.exe' '791cd6dbc56f7268fbf9c4652d6634b0f5c59687ab4e504565e58245952edd41'
 Copy-Item $pkgconf "$bin\pkgconf.exe"
+Copy-Item $pkgconf "$bin\pkgconf-2.4.3.exe"
 $jom = Fetch-Checked 'https://download.qt.io/official_releases/jom/jom_1_1_4.zip' 'jom.zip' 'd533c1ef49214229681e90196ed2094691e8c4a0a0bef0b2c901debcb562682b'
 Expand-Archive $jom "$downloads\jom" -Force
 Copy-Item "$downloads\jom\jom.exe" "$bin\jom.exe"
