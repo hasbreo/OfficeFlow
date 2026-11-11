@@ -1,0 +1,7804 @@
+// -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4; fill-column: 100 -*-
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+#include <config.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <charconv>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <cwchar>
+#include <cwctype>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <map>
+#include <optional>
+#include <regex>
+#include <set>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <tuple>
+#include <vector>
+
+#include <Windows.h>
+#include <appmodel.h>
+#include <dwmapi.h>
+#include <ole2.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <shobjidl.h>
+#include <shobjidl_core.h>
+
+#include <wincodec.h>
+#include <wincrypt.h>
+#include <winhttp.h>
+
+#include <WebView2.h>
+#include <WebView2EnvironmentOptions.h>
+
+#include <wrl.h>
+#include <wrl/ftm.h>
+#include <wil/com.h>
+
+#include <Poco/AutoPtr.h>
+#include <Poco/DOM/DOMParser.h>
+#include <Poco/DOM/Document.h>
+#include <Poco/DOM/Element.h>
+#include <Poco/DOM/NodeList.h>
+#include <Poco/File.h>
+#include <Poco/FileStream.h>
+#include <Poco/JSON/Array.h>
+#include <Poco/MemoryStream.h>
+#include <Poco/Path.h>
+#include <Poco/SAX/InputSource.h>
+#include <Poco/StringTokenizer.h>
+
+#include <common/AIHttpTransport.hpp>
+#include <common/Clipboard.hpp>
+#include <common/CODAConfig.hpp>
+#include <common/Common.hpp>
+#include <common/EditorFrameMessages.hpp>
+#include <common/JsonUtil.hpp>
+#include <common/LangUtil.hpp>
+#include <common/Protocol.hpp>
+#include <common/Log.hpp>
+#include <common/MobileApp.hpp>
+#include <common/RecentFiles.hpp>
+#include <common/SettingsStorage.hpp>
+#include <common/StringVector.hpp>
+#include <common/Uri.hpp>
+#include <net/FakeSocket.hpp>
+#include <wsd/Extensions.hpp>
+#include <wsd/COOLWSD.hpp>
+#include <wsd/DocumentBroker.hpp>
+#include <wsd/RequestDetails.hpp>
+
+#include "Resource.h"
+#include "windows.hpp"
+
+extern std::map<std::string, std::shared_ptr<DocumentBroker>> DocBrokers;
+extern std::mutex DocBrokersMutex;
+
+// Note that all pathnames in this code that are plain narrow strings (std::string) are in UTF-8 and
+// can thus *not* be used for actual file system operations. They must always be converted to UTF-16
+// first with Util::string_to_wide_string(). URIs one the other hand are valid as such as narrow
+// strings.
+
+enum class DocumentType
+{
+    TEXT,
+    SPREADSHEET,
+    PRESENTATION,
+    DRAWING,
+};
+
+enum class DocumentMode { EDIT, NEW, WELCOME, STARTER, CLOUD_ACCOUNT };
+
+struct FilenameAndUri
+{
+    // Just the basename (and extension), without folder
+    std::string filename;
+
+    // Complete file: URI
+    std::string uri;
+};
+
+// One open document, shown as a tab of the tabbed window. The starter
+// backstage, the welcome slideshow and the presenter console are each the only
+// document of a window of their own.
+struct DocumentTab
+{
+    int tabId = 0;
+    // The window this document is shown in. A document can move to another window, and the
+    // thread that forwards the engine's messages to the page reads this too.
+    std::atomic<HWND> hWnd{ nullptr };
+    // The presenter console this document opened, while it is presenting.
+    HWND hConsoleWnd = 0;
+    // For a presenter console, the document that opened it.
+    int presentingTabId = 0;
+    bool isConsole = false;
+    int fakeClientFd = -1;
+    int closeNotificationPipeForForwardingThread[2] = { -1, -1 };
+    FilenameAndUri filenameAndUri;
+    DocumentMode mode = DocumentMode::EDIT;
+    int appDocId = 0;
+    // The document kind the tab strip keys its icon and colour off: "writer",
+    // "calc", "impress", "draw", "starter", "welcome" or "other".
+    std::string docType = "other";
+    // The document holds changes that have not reached the file yet.
+    bool isModified = false;
+    // A PNG image of what the document shows, sent by the page, or empty until the page has sent
+    // one.
+    std::string thumbnailPng;
+    // The page has parsed its document and its stylesheets, so the WebView2 has something
+    // styled to put on the screen. It stays hidden until then.
+    bool hasContent = false;
+    // The page agreed to the close, so the tab can go without asking it again.
+    bool readyToClose = false;
+    // The tab has no WebView2 of its own. The document stays loaded in the engine under appDocId,
+    // with no session, until the tab gets a new WebView2.
+    bool viewDiscarded = false;
+    // The value of the activation counter when the tab was last brought to the front. The higher
+    // the value, the more recently the user was on the tab.
+    unsigned long long lastActiveTick = 0;
+    // The GetTickCount64() value when the current WebView2 of the tab was asked for.
+    ULONGLONG viewLiveSince = 0;
+    // The live-view limit asked the page to save the document, and the answer has not come yet.
+    bool dropWaitsForSave = false;
+    // The live-view limit has asked the page to save the document since the tab was last brought
+    // to the front.
+    bool dropSaveAsked = false;
+    wil::com_ptr<ICoreWebView2Controller> webViewController;
+    wil::com_ptr<ICoreWebView2> webView;
+    std::thread app2js;
+    // The origin of the address an account window was opened with, empty in any other window.
+    std::string accountOrigin;
+    std::string editorForm;
+    std::string editorFormUrl;
+    // The form's Origin header named the integrator. Nextcloud's says "null" (Referrer-Policy:
+    // no-referrer), so then only a fresh frame takes the form: see putCodaPageIn.
+    bool isEditorFormPosterKnown = false;
+    std::set<std::string> editorOrigins;
+    // The frame of an account window that shows CODA's editor
+    // page, null in any other window.
+    wil::com_ptr<ICoreWebView2Frame2> editorFrame;
+};
+
+// One top-level window. It holds its documents in the order the tab strip shows
+// them, and the window-wide state that belongs to none of them in particular.
+struct WindowState
+{
+    HWND hWnd = 0;
+    // The window shows documents as tabs, rather than being the welcome slideshow, the starter
+    // backstage or a presenter console.
+    bool isTabbed = false;
+    std::vector<int> tabIds;
+    int activeTabId = 0;
+    // The tab strip. It is created with the window and shown while the window holds a document.
+    wil::com_ptr<ICoreWebView2Controller> stripController;
+    wil::com_ptr<ICoreWebView2> stripWebView;
+    bool stripIsVisible = false;
+    bool stripHasContent = false;
+    // The transparent window raised over the web view for the duration of a drag from the desktop,
+    // and the drop target registered for it. Both are created when the first such drag arrives.
+    HWND hOverlayWnd = 0;
+    IDropTarget* dropTarget = nullptr;
+    int numMonitors = 0;
+    RECT originalRect;
+    LONG originalStyle;
+    bool isFullScreen = false;
+    bool isPresFullScreen = false;
+    // The window is closing: each tab that goes takes the next one with it.
+    bool closingAll = false;
+    // The GetTickCount64() value at which the pending run of the live-view limit is due, or 0
+    // when no run is pending.
+    ULONGLONG liveViewLimitDue = 0;
+};
+
+// Both keep their entries at a fixed address: the WebView2 completion handlers
+// capture an entry by reference and run long after the container has grown.
+static std::map<int, DocumentTab> documentTabs;
+static std::map<HWND, WindowState> windows;
+
+// The window that shows documents as tabs and that a newly opened document goes to. There can
+// be several such windows once a tab has been moved out into a window of its own, and this is the
+// one that was active last.
+static HWND tabbedWindow = 0;
+
+static DocumentTab* findTab(int tabId)
+{
+    const auto it = documentTabs.find(tabId);
+    return it == documentTabs.end() ? nullptr : &it->second;
+}
+
+static WindowState* findWindow(HWND hWnd)
+{
+    const auto it = windows.find(hWnd);
+    return it == windows.end() ? nullptr : &it->second;
+}
+
+static DocumentTab* activeTabOf(const WindowState& window)
+{
+    return findTab(window.activeTabId);
+}
+
+// Settings for automated tests, from the environment. Each is empty when its variable is not set.
+
+// CODA_TEST_REMOTE_DEBUGGING_PORT: the port on which the WebView2 browser takes DevTools Protocol
+// connections, for all web views of all windows. Decimal digits only.
+static std::wstring testRemoteDebuggingPort;
+
+// CODA_TEST_DOCUMENTS_DIR: the folder for new documents, in place of the Documents folder of the
+// user.
+static std::wstring testDocumentsDir;
+
+static HINSTANCE appInstance;
+static int appShowMode;
+
+static bool weOwnTheClipboard = false;
+
+// The COKit Office object, captured when the clipboard provider is installed, so a clipboard read
+// can go straight to the process-shared clipboard without needing a particular document.
+static COKit* office = nullptr;
+
+const char* user_name = nullptr;
+int coolwsd_server_socket_fd = -1;
+
+static std::string app_exe_path;
+std::string app_installation_path;
+
+std::string app_installation_uri;
+
+std::string localAppData;
+
+static std::wstring appUserModelId;
+
+static std::string uiLanguage = "en-US";
+static std::wstring appName;
+
+static COOLWSD* coolwsd = nullptr;
+
+static std::thread coolwsdThread;
+
+// The main window class name.
+static const wchar_t windowClass[] = L"CODA";
+
+// The class name of the transparent window that catches drops over the web view.
+static const wchar_t overlayWindowClass[] = L"CODADropOverlayWindow";
+
+// The class name of the card that shows a background document below its tab.
+static const wchar_t hoverCardWindowClass[] = L"CODATabHoverCard";
+
+// The hidden file open dialog and clipboard owner window class name.
+static const wchar_t hiddenOwnerWindowClass[] = L"CODAHiddenOwnerWindow";
+// The handle of that dummy window.
+static HWND hiddenOwnerWindow;
+
+// The tab whose web view the script or web message is meant for travels in the lParam of
+// CODA_WM_EXECUTESCRIPT and CODA_WM_POSTWEBMESSAGE, as several documents share one window.
+static const int CODA_WM_EXECUTESCRIPT = WM_APP + 1;
+static const int CODA_WM_LOADNEXTDOCUMENT = WM_APP + 2;
+static const int CODA_WM_POSTWEBMESSAGE = WM_APP + 3;
+static const int CODA_WM_SHOWFILEPICKER = WM_APP + 4;
+// Closes the tab named in the wParam. Posted rather than called, so a web view
+// is never torn down from inside one of its own callbacks.
+static const int CODA_WM_CLOSETAB = WM_APP + 5;
+// Brings the next document of the window to the front, or the previous one when the wParam is -1
+// rather than 1. Posted for the same reason the close above is.
+static const int CODA_WM_ACTIVATEADJACENTTAB = WM_APP + 6;
+// Pops up the menu for the tab named in the wParam, at the point of the window's client area in
+// the lParam. Posted, so the menu's modal loop does not run inside a callback of the strip.
+static const int CODA_WM_SHOWTABMENU = WM_APP + 7;
+// Moves the tab named in the wParam into a new window of its own, placed at the point of the screen
+// in the lParam. Posted, so the web views change windows outside a callback of the strip.
+static const int CODA_WM_MOVETABTONEWWINDOW = WM_APP + 8;
+// Moves the tab named in the wParam from another window into this one, to the position in the
+// tab order given in the lParam, or to the end when that is -1. Posted for the same reason.
+static const int CODA_WM_MOVETABTOWINDOW = WM_APP + 9;
+
+// One file pick the engine asked for, posted as CODA_WM_SHOWFILEPICKER to the hidden owner
+// window; the wide strings own the dialog's title and filter text.
+struct FilePickerRequest
+{
+    std::wstring title;
+    std::vector<std::pair<std::wstring, std::wstring>> filters;
+    void (*pfnPicked)(void* pContext, const char* pUrl);
+    void* pContext;
+};
+
+static HMONITOR primaryMonitor;
+
+static RecentFiles recentFiles;
+
+static FilenameAndUri fileSaveDialog(HWND hWnd,
+                                     const std::string& name,
+                                     const std::string& folder,
+                                     const std::vector<COMDLG_FILTERSPEC>& extensions,
+                                     size_t defaultTypeIndex = 0);
+
+static void openCOOLWindow(const FilenameAndUri& filenameAndUri, DocumentMode mode);
+
+static HANDLE copyEngineClipboardData(UINT format, const std::string& mimeType);
+
+static std::string MIME_type_for_clipboard_format(UINT format);
+
+static void applyTitleBarTheme(HWND hWnd);
+
+static void applyTitleBarThemeToAllWindows();
+
+static std::set<std::string> currentlyOpenDocumens()
+{
+    std::set<std::string> result;
+
+    for (const auto& i : documentTabs)
+        result.insert(i.second.filenameAndUri.uri);
+
+    return result;
+}
+
+// Vector of documents to open passed on the command line, or multiple documents to open selected in
+// a file open dialog. We open the next one only as soon as the previous one has finished loading.
+// Only the UI thread uses it.
+static std::deque<FilenameAndUri> filenamesAndUrisToOpen;
+
+// Open the next document waiting in filenamesAndUrisToOpen, if there is one. This can be called on
+// any thread, so it only posts a message, to the hidden window that is there for the whole run of
+// the app. The UI thread then takes the document from the queue and opens its window.
+void load_next_document()
+{
+    PostMessageW(hiddenOwnerWindow, CODA_WM_LOADNEXTDOCUMENT, 0, 0);
+}
+
+// The strings that CODA-W shows itself, in the user interface language, by context and source
+// text. They come from the coda_*.ts catalogs that CODA-Q uses too, in the Qt Linguist XML format.
+static std::map<std::pair<std::string, std::string>, std::wstring> translations;
+
+// Read the catalog for the user interface language. The catalogs are named with an underscore, as
+// coda_pt_BR.ts, and a region that has no catalog of its own falls back to the one for its
+// language, so de-AT gets coda_de.ts. English is the source language and has no catalog.
+static void loadTranslations()
+{
+    // A LANG environment variable can name a character set too, as in de_DE.UTF-8.
+    std::string language = uiLanguage.substr(0, uiLanguage.find('.'));
+    std::replace(language.begin(), language.end(), '-', '_');
+
+    std::string path;
+    for (const std::string& name : { language, language.substr(0, language.find('_')) })
+    {
+        const std::string candidate = app_installation_path + "translations\\coda_" + name + ".ts";
+        if (Poco::File(candidate).exists())
+        {
+            path = candidate;
+            break;
+        }
+    }
+    if (path.empty())
+        return;
+
+    try
+    {
+        // The parser gets the file as a stream, as it would take a path name for a URI.
+        Poco::FileInputStream stream(path);
+        Poco::XML::InputSource input(stream);
+        Poco::XML::DOMParser parser;
+        Poco::AutoPtr<Poco::XML::Document> document = parser.parse(&input);
+        Poco::AutoPtr<Poco::XML::NodeList> contexts = document->getElementsByTagName("context");
+        for (unsigned long i = 0; i < contexts->length(); ++i)
+        {
+            auto context = static_cast<Poco::XML::Element*>(contexts->item(i));
+            Poco::XML::Element* contextName = context->getChildElement("name");
+            if (!contextName)
+                continue;
+
+            Poco::AutoPtr<Poco::XML::NodeList> messages = context->getElementsByTagName("message");
+            for (unsigned long j = 0; j < messages->length(); ++j)
+            {
+                auto message = static_cast<Poco::XML::Element*>(messages->item(j));
+                // A string with plural forms has a translation for each, and CODA-W has none.
+                if (message->getAttribute("numerus") == "yes")
+                    continue;
+
+                Poco::XML::Element* source = message->getChildElement("source");
+                Poco::XML::Element* translation = message->getChildElement("translation");
+                if (!source || !translation || translation->innerText().empty())
+                    continue;
+
+                // As in a catalog that lrelease compiles for CODA-Q, a translation that is still
+                // marked unfinished is used too, and one for a string that is gone is not.
+                const std::string type = translation->getAttribute("type");
+                if (type == "vanished" || type == "obsolete")
+                    continue;
+
+                translations[{ contextName->innerText(), source->innerText() }] =
+                    Util::string_to_wide_string(translation->innerText());
+            }
+        }
+    }
+    catch (const Poco::Exception& exception)
+    {
+        LOG_ERR("Could not read the translations in '" << path << "': " << exception.displayText());
+    }
+}
+
+// The text of a string that CODA-W shows, in the user interface language, or in English when the
+// catalog has no translation for it. The call has the form that lupdate looks for, with both
+// arguments as string literals, so update-translations finds the string. A string that CODA-Q
+// shows too uses the context that it has there, so that it is translated once.
+static std::wstring translate(const char* context, const char* source)
+{
+    const auto it = translations.find({ context, source });
+    if (it != translations.end())
+        return it->second;
+    return Util::string_to_wide_string(source);
+}
+
+static void processMessage(DocumentTab& tab, wil::unique_cotaskmem_string& message);
+
+static void requestCloseTab(HWND hWnd, int tabId);
+
+static void activateAdjacentTab(WindowState& window, int direction);
+
+static void showTabContextMenu(HWND hWnd, int tabId, POINT point);
+
+static void moveTabToNewWindow(HWND hWnd, int tabId, const POINT* dropPoint = nullptr);
+
+static void moveTabToWindow(int tabId, WindowState& target, int insertAt);
+
+static void layoutTabs(WindowState& window);
+
+static void enforceLiveViewLimit(WindowState& window);
+
+static void restoreActiveTabView(WindowState& window);
+
+static RECT documentArea(const WindowState& window);
+
+static void updateStripVisibility(WindowState& window);
+
+static void pushTabsToStrip(WindowState& window);
+
+static void hideHoverCard();
+
+static bool hasStripInTitleBar(const WindowState& window);
+
+static int topResizeBorderHeight(HWND hWnd);
+
+static int titleBarFrameHeight(const WindowState& window);
+
+static std::string fileUriToWindowsPath(const std::string& uri);
+
+static std::string pathToURI(const Poco::Path& path);
+
+[[noreturn]] static void fatal(const std::string& message)
+{
+    MessageBoxW(hiddenOwnerWindow, Util::string_to_wide_string(message).c_str(), L"ERROR", MB_OK);
+    std::abort();
+}
+
+static FilenameAndUri generate_new_copy(const std::wstring& templateSourcePath,
+                                        const std::wstring& templateBasename,
+                                        const std::wstring& templateExtension)
+{
+    std::wstring documents = testDocumentsDir;
+    if (documents.empty())
+    {
+        PWSTR documentsFolder;
+        SHGetKnownFolderPath(FOLDERID_Documents, 0, NULL, &documentsFolder);
+        documents = documentsFolder;
+        CoTaskMemFree(documentsFolder);
+    }
+
+    int counter = 0;
+    std::wstring templateCopyPath;
+
+    do
+    {
+        std::wstring number = L"";
+        if (counter > 0)
+            number = L" (" + std::to_wstring(counter) + L")";
+        templateCopyPath = documents + L"\\" + templateBasename + number + L"." + templateExtension;
+        counter++;
+    } while (std::filesystem::exists(std::filesystem::path(templateCopyPath)));
+
+    std::error_code ec;
+    std::filesystem::copy_file(templateSourcePath, templateCopyPath, ec);
+
+    if (ec)
+        return {};
+
+    auto path = Poco::Path(Util::wide_string_to_string(templateCopyPath));
+
+    return { Util::wide_string_to_string(templateCopyPath), pathToURI(path) };
+}
+
+static std::wstring new_document(DocumentType type,
+                                 const std::string& templateRelativePath,
+                                 std::string basename)
+{
+    std::wstring templateBasename, templateExtension, templateSourcePath;
+
+    if (templateRelativePath == "")
+    {
+        // Old-style simple blank documents
+        switch (type)
+        {
+            case DocumentType::TEXT:
+                templateBasename = L"TextDocument";
+                templateExtension = L"odt";
+                break;
+            case DocumentType::SPREADSHEET:
+                templateBasename = L"Spreadsheet";
+                templateExtension = L"ods";
+                break;
+            case DocumentType::PRESENTATION:
+                templateBasename = L"Presentation";
+                templateExtension = L"odp";
+                break;
+            case DocumentType::DRAWING:
+                templateBasename = L"Drawing";
+                templateExtension = L"odg";
+                break;
+            default:
+                fatal("Unexpected case in new_document()");
+        }
+        basename = Util::wide_string_to_string(templateBasename);
+        templateSourcePath = Util::string_to_wide_string(app_installation_path) +
+            L"..\\templates\\" + templateBasename + L"." + templateExtension;
+    }
+    else
+    {
+        // A template chosen from the "Backstage"
+        std::string decodedTemplateRelativePath;
+        Poco::URI::decode(templateRelativePath, decodedTemplateRelativePath);
+
+        templateSourcePath =
+            Util::string_to_wide_string(app_installation_path +
+                                        "..\\cool\\" + decodedTemplateRelativePath);
+        auto wrelpath = Util::string_to_wide_string(decodedTemplateRelativePath);
+        auto const lastDot = wrelpath.find_last_of(L'.');
+        if (lastDot == std::wstring::npos)
+            return L"";
+        templateExtension = wrelpath.substr(lastDot + 1);
+    }
+
+    // The basename is URI-encoded because in some localisation it might contain spaces.
+    std::string decodedBasename;
+    Poco::URI::decode(basename, decodedBasename);
+    auto filenameAndUri = generate_new_copy(templateSourcePath,
+                                            Util::string_to_wide_string(decodedBasename),
+                                            templateExtension);
+
+    // If creating a new copy of the template failed, return an empty string
+    if (filenameAndUri.uri == "")
+        return L"";
+
+    return Util::string_to_wide_string(fileUriToWindowsPath(filenameAndUri.uri));
+}
+
+static int generate_new_app_doc_id()
+{
+    // Start with a random document id to catch code that might assume it to be some fixed value,
+    // like 0 or 1. Also make it obvious that this numeric "app doc id", used by the mobile apps and
+    // CODA, is not related to the string document ids (usually with several leading zeroes) used in
+    // the C++ bits of normal COOL.
+    static int id = 42 + (std::time(nullptr) % 100);
+
+    DocumentData::allocate(id);
+    return id++;
+}
+
+static void send2JS(const DocumentTab& tab, const char* buffer, int length)
+{
+    const bool binaryMessage = COOLProtocol::isBinaryMessage(buffer, static_cast<size_t>(length));
+    std::string pretext{ binaryMessage
+                             ? "window.TheFakeWebSocket.onmessage({'data': window.atob('"
+                             : "window.TheFakeWebSocket.onmessage({'data': window.b64d('" };
+    const std::string posttext{ "')});" };
+
+    DWORD base64len = length * 2 + 100;
+    std::vector<char> base64(base64len);
+    if (!CryptBinaryToStringA((BYTE*)buffer, length, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                              base64.data(), &base64len))
+    {
+        LOG_ERR("CryptBinaryToStringA failed: " << GetLastError());
+        return;
+    }
+
+    if (binaryMessage)
+        LOG_TRC("To execute in JS: " << pretext << "stuff" << posttext);
+    else
+    {
+        auto s = std::string(buffer, length);
+        LOG_TRC("To execute in JS: " << pretext << s << posttext);
+    }
+    Log::flush();
+
+    char* wparam = _strdup((pretext + std::string(base64.data()) + posttext).c_str());
+
+    PostMessageW(tab.hWnd, CODA_WM_EXECUTESCRIPT, (WPARAM)wparam, (LPARAM)tab.tabId);
+}
+
+// Convert a file: URI to a native Windows path. A URI of a file on a network share, like
+// "file://host/share/dir/file", becomes "\\host\share\dir\file". A URI of a local file, like
+// "file:///C:/dir/file", becomes "C:\dir\file". A URI of another scheme, and one that cannot be
+// parsed, is returned unchanged.
+static std::string fileUriToWindowsPath(const std::string& uri)
+{
+    if (!uri.starts_with("file:"))
+        return uri;
+
+    try
+    {
+        const Poco::URI parsedUri(uri);
+        const std::string host = parsedUri.getHost();
+        std::string path = parsedUri.getPath();
+        if (!host.empty())
+            path = "\\\\" + host + path;
+        else if (path.size() > 3 && path[0] == '/' && path[2] == ':')
+            path = path.substr(1);
+        for (char& c : path)
+        {
+            if (c == '/')
+                c = '\\';
+        }
+        return path;
+    }
+    catch (const std::exception& exc)
+    {
+        LOG_ERR("Bad file URI [" << uri << "]: " << exc.what());
+        return uri;
+    }
+}
+
+// COKit file save dialog callback.
+void output_file_dialog_from_core(const char* suggestedURI, char* result, size_t resultLen)
+{
+    // Some sanity checks first.
+    if (resultLen == 0)
+        return;
+
+    // The absolutely shortest file: URI on Windows would be something like "file:///C:/f".
+    if (resultLen < 12)
+    {
+        result[0] = '\0';
+        return;
+    }
+
+    // fileUriToWindowsPath returns a backslash-separated native path (UNC-aware),
+    // so split the folder and filename on backslash.
+    const std::string path = fileUriToWindowsPath(suggestedURI);
+    const auto lastSlash = path.find_last_of('\\');
+    const auto filename = path.substr(lastSlash + 1);
+    const auto folder = path.substr(0, lastSlash);
+    auto lastPeriod = filename.find_last_of('.');
+    auto extension = filename.substr(lastPeriod + 1);
+    auto filenameAndUri = fileSaveDialog(hiddenOwnerWindow, filename, folder,
+                                         {
+                                             {
+                                                 Util::string_to_wide_string(extension).c_str(),
+                                                 Util::string_to_wide_string("*." + extension).c_str()
+                                             }
+                                         });
+
+    if (filenameAndUri.uri.size() < resultLen)
+        strcpy(result, filenameAndUri.uri.c_str());
+    else
+        result[0] = '\0';
+}
+
+// COKit reveal-in-file-manager callback: open Explorer with the document selected.
+void reveal_in_file_manager(const char* uri)
+{
+    if (uri == nullptr || *uri == '\0')
+        return;
+
+    const std::wstring widePath = Util::string_to_wide_string(fileUriToWindowsPath(uri));
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    if (SUCCEEDED(SHParseDisplayName(widePath.c_str(), nullptr, &pidl, 0, nullptr)) && pidl)
+    {
+        SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
+        CoTaskMemFree(pidl);
+    }
+}
+
+static void stopServer()
+{
+    SigUtil::requestShutdown();
+
+    // Wait until coolwsdThread is torn down, so that we don't start cleaning up too early.
+    coolwsdThread.join();
+}
+
+static void createAndStartMessagePumpThread(DocumentTab& data)
+{
+    // Create a socket pair to notify the below thread when the document has been closed
+    fakeSocketPipe2(data.closeNotificationPipeForForwardingThread);
+
+    // Start another thread to read responses and forward them to the JavaScript
+    data.app2js = std::thread(
+        [&data]
+        {
+            ProcUtil::setThreadName("app2js " + std::to_string(data.appDocId));
+            while (true)
+            {
+                struct pollfd pollfd[2];
+                pollfd[0].fd = data.fakeClientFd;
+                pollfd[0].events = POLLIN;
+                pollfd[1].fd = data.closeNotificationPipeForForwardingThread[1];
+                pollfd[1].events = POLLIN;
+                if (fakeSocketPoll(pollfd, 2, -1) > 0)
+                {
+                    if (pollfd[1].revents == POLLIN)
+                    {
+                        // The code below handling the "BYE" fake Websocket message has closed the other
+                        // end of the closeNotificationPipeForForwardingThread. Let's close the other
+                        // end too just for cleanliness, even if a FakeSocket as such is not a system
+                        // resource so nothing is saved by closing it.
+                        fakeSocketClose(data.closeNotificationPipeForForwardingThread[1]);
+
+                        // Close our end of the fake socket connection to the ClientSession thread, so
+                        // that it terminates.
+                        fakeSocketClose(data.fakeClientFd);
+
+                        return;
+                    }
+                    if (pollfd[0].revents == POLLIN)
+                    {
+                        int n = fakeSocketAvailableDataLength(data.fakeClientFd);
+                        // I don't want to check for n being -1 here, even if that will lead to a crash,
+                        // as n being -1 is a sign of something being wrong elsewhere anyway, and I
+                        // prefer to fix the root cause. Let's see how well this works out.
+                        if (n == 0)
+                            return;
+                        std::vector<char> buf(n);
+                        n = fakeSocketRead(data.fakeClientFd, buf.data(), n);
+                        send2JS(data, buf.data(), n);
+                    }
+                }
+                else
+                {
+                    break;
+                }
+            }
+            assert(false);
+        });
+}
+
+static void do_hullo_handling_things(DocumentTab& data)
+{
+    // Now we know that the JS has started completely
+
+    // Contact the permanently (during app lifetime) listening COOLWSD server "public" socket
+    assert(coolwsd_server_socket_fd != -1);
+    int rc = fakeSocketConnect(data.fakeClientFd, coolwsd_server_socket_fd);
+    (void)rc;
+    assert(rc != -1);
+
+    createAndStartMessagePumpThread(data);
+
+    // First we must send the URL. This corresponds to the GET request with Upgrade to WebSocket.
+    // This *must* be the first message written to the "client" thread. We don't need to do this
+    // write in a separate thread, and we can't, because if we do that, we will occasionally run into
+    // a bug when the "coolclient" message sent by the JS is received and gets forwarded to the
+    // "client" thread before we have written the URL to it.
+
+    std::string message(data.filenameAndUri.uri + " " + std::to_string(data.appDocId));
+    fakeSocketWriteQueue(data.fakeClientFd, message.c_str(), message.size());
+}
+
+// automatic: the first start or an update ("WELCOME auto"), as opposed to Help > Latest
+// Updates ("WELCOME").
+static void do_welcome_handling_things(DocumentTab& data, [[maybe_unused]] bool automatic)
+{
+#if ENABLE_DEBUG
+    // A debug build opens the slideshow only from the menu.
+    if (automatic)
+        return;
+#endif
+
+    const auto welcomeSlideshow = Poco::Path(app_installation_path + "..\\cool\\welcome\\welcome-slideshow.odp");
+
+    if (!Poco::File(welcomeSlideshow).exists())
+        return;
+
+    openCOOLWindow({ welcomeSlideshow.getFileName(), Poco::URI(welcomeSlideshow).toString() }, DocumentMode::WELCOME);
+}
+
+static void enter_full_screen(WindowState& data, HMONITOR monitor, bool saveRestoreInfo)
+{
+    if (data.isFullScreen)
+        return;
+
+    LONG style = GetWindowLong(data.hWnd, GWL_STYLE);
+
+    if (saveRestoreInfo)
+    {
+        GetWindowRect(data.hWnd, &data.originalRect);
+        data.originalStyle = style;
+    }
+
+    // Remove window borders and title bar
+    style &= ~(WS_OVERLAPPEDWINDOW);
+    SetWindowLong(data.hWnd, GWL_STYLE, style);
+
+    MONITORINFO monitorInfo = { sizeof(monitorInfo) };
+    GetMonitorInfo(monitor, &monitorInfo);
+
+    // Resize window to fill the entire monitor
+    SetWindowPos(data.hWnd, NULL,
+                 monitorInfo.rcMonitor.left, monitorInfo.rcMonitor.top,
+                 monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left,
+                 monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top,
+                 SWP_NOZORDER | SWP_FRAMECHANGED);
+    data.isFullScreen = true;
+
+    // The presentation has the monitor to itself, tab strip included.
+    updateStripVisibility(data);
+}
+
+static void leave_full_screen(WindowState& data)
+{
+    if (!data.isFullScreen)
+        return;
+
+    SetWindowLong(data.hWnd, GWL_STYLE, data.originalStyle);
+
+    // Restore in two steps, position first, then size.
+    // So if we restore from external monitor at a different resolution than
+    // the laptop monitor, that a WM_DPICHANGED triggered from changing monitor
+    // (which gets processed during SetWindowPos) doesn't mangle the size.
+    SetWindowPos(data.hWnd, NULL,
+                 data.originalRect.left, data.originalRect.top,
+                 data.originalRect.right - data.originalRect.left,
+                 data.originalRect.bottom - data.originalRect.top,
+                 SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOSIZE);
+    SetWindowPos(data.hWnd, NULL,
+                 data.originalRect.left, data.originalRect.top,
+                 data.originalRect.right - data.originalRect.left,
+                 data.originalRect.bottom - data.originalRect.top,
+                 SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOMOVE);
+
+    data.isFullScreen = false;
+
+    updateStripVisibility(data);
+}
+
+static void do_bye_handling_things(const DocumentTab& data)
+{
+    LOG_TRC_NOFILE(
+        "Document window terminating on JavaScript side. Closing our end of the socket.");
+
+    // Close one end of the socket pair, that will wake up the forwarding thread above
+    fakeSocketClose(data.closeNotificationPipeForForwardingThread[0]);
+}
+
+static void quit_application()
+{
+    // Ask each window to close, the same way the window's own close button does. The messages are
+    // queued, so the windows are all still up when this returns. The application exits when the
+    // last one has gone.
+    for (const auto& entry : windows)
+        PostMessageW(entry.first, WM_CLOSE, 0, 0);
+}
+
+static void do_print(int appDocId)
+{
+    const std::string tempFile = FileUtil::createRandomTmpDir() + "\\p.pdf";
+    const std::string tempFileUri = pathToURI(Poco::Path(tempFile));
+
+    // Leave form fields and comments out of the printout, like the browser does when printing to
+    // PDF.
+    DocumentData::get(appDocId).loKitDocument->saveAs(
+        tempFileUri.c_str(), "pdf",
+        "{\"ExportFormFields\":{\"type\":\"boolean\",\"value\":\"false\"},"
+        "\"ExportNotes\":{\"type\":\"boolean\",\"value\":\"false\"}}");
+
+    STARTUPINFOW startupInfo{ sizeof(STARTUPINFOW) };
+    PROCESS_INFORMATION processInformation;
+
+    if (!CreateProcessW(
+            Util::string_to_wide_string(app_installation_path + "..\\PrintPDFAndDelete.exe").c_str(),
+            Util::string_to_wide_string("PrintPDFAndDelete " + tempFileUri).data(), NULL, NULL,
+            TRUE, 0, NULL, NULL, &startupInfo, &processInformation))
+        LOG_ERR("CreateProcess failed: " << GetLastError());
+}
+
+static void do_other_message_handling_things(const DocumentTab& data, const char* message)
+{
+    LOG_TRC_NOFILE("Handling other message:'" << message << "'");
+
+    fakeSocketWriteQueue(data.fakeClientFd, message, strlen(message));
+}
+
+namespace
+{
+// Deliver a reply to a browser-side postMobileCall() as a posted web message,
+// i.e. structured data rather than generated JS source. We build the envelope
+// {"id":<id>,"reply":<value>} and marshal it to the WebView2 UI thread, where
+// PostWebMessageAsJson() hands the parsed value to the page's
+// chrome.webview 'message' listener (see global.js). The browser receives
+// <reply> as a real JS value (string or object), so Windows paths, file names
+// etc. never get interpolated into a JS string literal. This mirrors how the
+// macOS (WKScriptMessageHandlerWithReply) and Qt (QWebChannel) apps return
+// values; JSON encoding takes care of all escaping.
+void postReplyToCall(HWND hWnd, int tabId, int id, const Poco::Dynamic::Var& reply)
+{
+    Poco::JSON::Object::Ptr envelope = new Poco::JSON::Object();
+    envelope->set("id", id);
+    envelope->set("reply", reply);
+    std::ostringstream oss;
+    envelope->stringify(oss);
+    PostMessageW(hWnd, CODA_WM_POSTWEBMESSAGE, (WPARAM)_strdup(oss.str().c_str()), (LPARAM)tabId);
+}
+} // namespace
+
+static void do_getrecentdocs(const DocumentTab& data, int id)
+{
+    postReplyToCall(data.hWnd, data.tabId, id, recentFiles.serialiseFiltered(currentlyOpenDocumens()));
+}
+
+// It happens that some other process opens the clipboard for a short time, and if we happen to try
+// during that time it will fail. Workaround for that: a function that tries a couple of times.
+
+static BOOL try_open_clipboard(HWND hWnd)
+{
+    const int NTRIES = 10;
+    for (int i = 0; i < NTRIES; i++)
+    {
+        if (OpenClipboard(hWnd))
+            return TRUE;
+        Sleep(5);
+    }
+    LOG_ERR("OpenClipboard() failed repeatedly, last error: " << GetLastError());
+    return FALSE;
+}
+
+static std::wstring get_clipboard_format_name(UINT format)
+{
+    const int NNAME{ 1000 };
+    wchar_t name[NNAME];
+    int nwc = GetClipboardFormatNameW(format, name, NNAME);
+    if (nwc)
+        return std::wstring(name, nwc);
+    return L"";
+}
+
+static std::string get_html_clipboard_fragment(const char* data)
+{
+    std::string htmlData(data);
+
+    std::regex startRegex("(\r|\n)StartFragment:(\\d+)(\r|\n)");
+    std::regex endRegex("(\r|\n)EndFragment:(\\d+)(\r|\n)");
+
+    std::smatch match;
+    size_t startPos = std::string::npos;
+    size_t endPos = std::string::npos;
+
+    if (std::regex_search(htmlData, match, startRegex))
+        startPos = std::stoul(match[2]);
+
+    if (std::regex_search(htmlData, match, endRegex))
+        endPos = std::stoul(match[2]);
+
+    if (startPos == std::string::npos || endPos == std::string::npos || startPos >= endPos || endPos > htmlData.size())
+        return "";
+
+    return htmlData.substr(startPos, endPos - startPos);
+}
+
+// Convert an HTML document into the Windows "HTML Format" clipboard payload.
+//
+// See
+// https://learn.microsoft.com/en-us/windows/win32/dataxchg/html-clipboard-format
+// for the specification of that format.
+//
+// This is deliberately a tiny tokenizer, not a full parser. It is not likely that
+// engine would actually produce pathological HTML with things like the string "<body"
+// inside an attribute, comment, or whatever, but be careful anyway.
+//   * The <body> start tag may carry attributes; we find the true end '>'
+//     of the start tag while respecting quoted attribute values.
+//   * The substring "<body" may occur inside an attribute value in <head>
+//     (e.g. <meta content="<body>">). Because we scan tag by tag and skip
+//     over quoted attribute regions, such occurrences are not mistaken for
+//     the body element.
+//   * Comments, <!doctype>/<?...?> declarations, and the raw-text elements
+//     <script>/<style>/<textarea>/<title> are skipped wholesale, so "<body"
+//     or "</body>" appearing as text/inside them is ignored too.
+//
+//  Header lines use CRLF, matching what Windows browsers emit.
+
+struct BodySpan
+{
+    bool found = false;
+    bool endFound = false;
+    std::size_t startBegin = 0;
+    std::size_t endEnd = 0;
+};
+
+static bool case_insensitive_match(const std::string& haystack, std::size_t pos, const std::string_view needle)
+{
+    if (pos + needle.size() > haystack.size())
+        return false;
+    for (std::size_t k = 0; k < needle.size(); ++k)
+    {
+        auto a = static_cast<unsigned char>(haystack[pos + k]);
+        auto b = static_cast<unsigned char>(needle[k]);
+        if (std::tolower(a) != std::tolower(b))
+            return false;
+    }
+    return true;
+}
+
+// i points at the '<' of a tag. Return the index just past the tag's
+// closing '>', honoring single- and double-quoted attribute values (so a
+// '>' inside a quoted value does not end the tag).
+static std::size_t skip_tag(const std::string& s, std::size_t i)
+{
+    const std::size_t n = s.size();
+    ++i;
+    char quote = 0;
+    while (i < n)
+    {
+        char c = s[i];
+        if (quote)
+        {
+            if (c == quote)
+                quote = 0;
+        }
+        else if (c == '"' || c == '\'')
+            quote = c;
+        else if (c == '>')
+            return i + 1;
+        ++i;
+    }
+    return n; // unterminated tag: treat rest of string as the tag
+}
+
+static bool name_equals(const std::string_view name, const std::string_view lit)
+{
+    if (name.size() != lit.size())
+        return false;
+    for (std::size_t k = 0; k < lit.size(); ++k)
+    {
+        if (std::tolower(static_cast<unsigned char>(name[k])) !=
+            std::tolower(static_cast<unsigned char>(lit[k])))
+            return false;
+    }
+    return true;
+}
+
+static BodySpan find_body(const std::string& s)
+{
+    BodySpan r;
+    const std::size_t n = s.size();
+    std::size_t i = 0;
+
+    while (i < n)
+    {
+        if (s[i] != '<')
+        {
+            ++i;
+            continue;
+        }
+
+        // Comment: <!-- ... -->
+        if (case_insensitive_match(s, i, "<!--"))
+        {
+            std::size_t e = s.find("-->", i + 4);
+            i = (e == std::string::npos) ? n : e + 3;
+            continue;
+        }
+        // Declaration or processing instruction: <! ... >  /  <? ... >
+        if (i + 1 < n && (s[i + 1] == '!' || s[i + 1] == '?'))
+        {
+            std::size_t e = s.find('>', i + 2);
+            i = (e == std::string::npos) ? n : e + 1;
+            continue;
+        }
+
+        const bool isEnd = (i + 1 < n && s[i + 1] == '/');
+        const std::size_t nameStart = i + (isEnd ? 2 : 1);
+
+        // Read an ASCII tag name (letters, digits, '-').
+        std::size_t j = nameStart;
+        while (j < n)
+        {
+            unsigned char u = static_cast<unsigned char>(s[j]);
+            if (std::isalnum(u) || u == '-')
+                ++j;
+            else
+                break;
+        }
+        std::string_view name(s.data() + nameStart, j - nameStart);
+
+        if (name.empty()) // a bare '<' that isn't a real tag
+        {
+            ++i;
+            continue;
+        }
+
+        if (!isEnd && name_equals(name, "body"))
+        {
+            r.found = true;
+            r.startBegin = i;
+            i = skip_tag(s, i); // step past the (possibly attributed) start tag
+            continue;
+        }
+        if (isEnd && name_equals(name, "body"))
+        {
+            r.endFound = true;
+            r.endEnd = skip_tag(s, i);
+            break; // done: we have both ends
+        }
+
+        // Raw-text elements: skip their entire content to the matching end tag
+        // so their text (which may contain '<', '>', quotes, "<body>", etc.)
+        // never confuses the scan.
+        if (!isEnd && (name_equals(name, "script") || name_equals(name, "style") ||
+                       name_equals(name, "textarea") || name_equals(name, "title")))
+        {
+            std::size_t after = skip_tag(s, i);
+            std::string endTag = "</";
+            endTag.append(name);
+            std::size_t e = after;
+            std::size_t close = std::string::npos;
+            while (e + endTag.size() <= n)
+            {
+                if (case_insensitive_match(s, e, endTag))
+                {
+                    close = e;
+                    break;
+                }
+                ++e;
+            }
+            i = (close == std::string::npos) ? n : skip_tag(s, close);
+            continue;
+        }
+
+        // Any other tag: skip it.
+        i = skip_tag(s, i);
+    }
+    return r;
+}
+
+static std::string num10(std::size_t v)
+{
+    char b[24];
+    std::snprintf(b, sizeof b, "%010zu", v);
+    return std::string(b);
+}
+
+static std::string build_header(std::size_t startHtml, std::size_t endHtml,
+                                std::size_t startFrag, std::size_t endFrag)
+{
+    std::string h;
+    h += "Version:0.9\r\n";
+    h += "StartHTML:"     + num10(startHtml) + "\r\n";
+    h += "EndHTML:"       + num10(endHtml)   + "\r\n";
+    h += "StartFragment:" + num10(startFrag) + "\r\n";
+    h += "EndFragment:"   + num10(endFrag)   + "\r\n";
+    return h;
+}
+
+std::string generate_html_format(const std::string& html)
+{
+    static const std::string SF = "<!--StartFragment-->";
+    static const std::string EF = "<!--EndFragment-->";
+
+    // Measure the headers once with dummy values.
+    const std::size_t headerLen = build_header(0, 0, 0, 0).size();
+
+    // Locate the body. Degrade gracefully if it's missing or unterminated.
+    const BodySpan b = find_body(html);
+    const std::size_t startBegin = b.found ? b.startBegin : 0;
+    const std::size_t endEnd = (b.found && b.endFound) ? b.endEnd : html.size();
+
+    // Assemble the content: prefix + <!--StartFragment--> + <body>..</body>
+    //                       + <!--EndFragment--> + suffix.
+    std::string content;
+    content.reserve(html.size() + SF.size() + EF.size());
+    content.append(html, 0, startBegin);
+    content.append(SF);
+    content.append(html, startBegin, endEnd - startBegin);
+    content.append(EF);
+    content.append(html, endEnd, std::string::npos);
+
+    // Offsets are byte positions from the very start of the payload.
+    const std::size_t startHtml = headerLen;
+    const std::size_t endHtml = headerLen + content.size();
+    const std::size_t startFrag = headerLen + startBegin + SF.size(); // at '<body'
+    const std::size_t endFrag = headerLen + endEnd + SF.size(); // just past '</body>'
+
+    return build_header(startHtml, endHtml, startFrag, endFrag) + content;
+}
+
+static void do_open_hyperlink(HWND hWnd, std::wstring url)
+{
+    // For file: URIs hand ShellExecute a native (UNC-aware) Windows path; other
+    // schemes (http:, mailto:, ...) pass through unchanged.
+    const std::wstring target =
+        Util::string_to_wide_string(fileUriToWindowsPath(Util::wide_string_to_string(url)));
+    ShellExecuteW(hWnd, NULL, target.c_str(), NULL, NULL, SW_SHOW);
+}
+
+struct MonitorInfo
+{
+    HMONITOR hMonitor;
+    DWORD dwFlags;
+};
+
+typedef std::vector<MonitorInfo> Monitors;
+
+BOOL monitorEnum(HMONITOR monitor, HDC, LPRECT, LPARAM data)
+{
+    MONITORINFO monitorInfo = { sizeof(monitorInfo) };
+    GetMonitorInfo(monitor, &monitorInfo);
+
+    Monitors& monitors = *reinterpret_cast<Monitors*>(data);
+    monitors.push_back(MonitorInfo{monitor, monitorInfo.dwFlags});
+    return true;
+}
+
+Monitors getMonitors()
+{
+    Monitors monitors;
+    EnumDisplayMonitors(nullptr, nullptr, monitorEnum, reinterpret_cast<LPARAM>(&monitors));
+    return monitors;
+}
+
+static void exchangeMonitors(DocumentTab& data)
+{
+    Monitors monitors(getMonitors());
+    if (monitors.size() < 2)
+        return;
+
+    WindowState* presentationWindow = findWindow(data.hWnd);
+    if (!presentationWindow)
+        return;
+    WindowState* consoleWindow = data.hConsoleWnd ? findWindow(data.hConsoleWnd) : nullptr;
+
+    HMONITOR hConsoleMonitor = data.hConsoleWnd ? MonitorFromWindow(data.hConsoleWnd, MONITOR_DEFAULTTONEAREST) : 0;
+    HMONITOR hPresentationMonitor = MonitorFromWindow(data.hWnd, MONITOR_DEFAULTTONEAREST);
+
+    size_t origConsoleMonitor = 0;
+    size_t origPresentationMonitor = 0;
+    for (size_t i = 0; i < monitors.size(); ++i)
+    {
+        if (hConsoleMonitor && monitors[i].hMonitor == hConsoleMonitor)
+            origConsoleMonitor = i;
+        if (monitors[i].hMonitor == hPresentationMonitor)
+            origPresentationMonitor = i;
+    }
+
+    leave_full_screen(*presentationWindow);
+
+    size_t newPresentationMonitor = origPresentationMonitor;
+
+    if (consoleWindow)
+    {
+        leave_full_screen(*consoleWindow);
+
+        size_t newConsoleMonitor = (origConsoleMonitor + 1) % monitors.size();
+        if (newConsoleMonitor == newPresentationMonitor)
+            newPresentationMonitor = (newPresentationMonitor + 1) % monitors.size();
+
+        enter_full_screen(*consoleWindow, monitors[newConsoleMonitor].hMonitor, false);
+    }
+    else
+    {
+        newPresentationMonitor = (newPresentationMonitor + 1) % monitors.size();
+    }
+
+    enter_full_screen(*presentationWindow, monitors[newPresentationMonitor].hMonitor, false);
+}
+
+static std::string pathToURI(const Poco::Path& path)
+{
+    auto uri = Poco::URI(path);
+
+    if (path.getNode() == "")
+        return uri.toString();
+
+    uri.setHost(path.getNode());
+    return uri.toString();
+}
+
+static std::vector<FilenameAndUri> fileOpenDialog(HWND hWnd,
+                                                  const std::wstring& title,
+                                                  const std::vector<COMDLG_FILTERSPEC>& filters,
+                                                  bool multiSelect)
+{
+    IFileOpenDialog* dialog;
+
+    if (!SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER,
+                                    IID_IFileOpenDialog, reinterpret_cast<void**>(&dialog))))
+        fatal("CoCreateInstance(CLSID_FileOpenDialog) failed");
+
+    if (!title.empty())
+        dialog->SetTitle(title.c_str());
+
+    if (!filters.empty())
+        if (!SUCCEEDED(dialog->SetFileTypes(filters.size(), filters.data())))
+            fatal("dialog->SetFileTypes() failed");
+
+    FILEOPENDIALOGOPTIONS options;
+    if (SUCCEEDED(dialog->GetOptions(&options)))
+    {
+        if (multiSelect)
+            options |= FOS_ALLOWMULTISELECT;
+        options &= ~FOS_DONTADDTORECENT;
+        dialog->SetOptions(options);
+    }
+
+    HRESULT dialogResult = dialog->Show(hWnd);
+
+    if (!SUCCEEDED(dialogResult))
+        return {};
+
+    std::vector<FilenameAndUri> result;
+
+    IShellItemArray* items;
+    if (!SUCCEEDED(dialog->GetResults(&items)))
+        fatal("dialog->GetResults() failed");
+
+    DWORD numItems;
+    if (!SUCCEEDED(items->GetCount(&numItems)))
+        fatal("items->GetCount() failed");
+
+    for (int i = 0; i < numItems; i++)
+    {
+        IShellItem* item;
+        PWSTR fileSysPath;
+        if (SUCCEEDED(items->GetItemAt(i, &item)) &&
+            SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &fileSysPath)))
+        {
+            auto path = Poco::Path(Util::wide_string_to_string(std::wstring(fileSysPath)));
+            result.push_back({ path.getFileName(), pathToURI(path) });
+            CoTaskMemFree(fileSysPath);
+            item->Release();
+        }
+    }
+    items->Release();
+    dialog->Release();
+
+    return result;
+}
+
+static std::vector<COMDLG_FILTERSPEC>getSaveAsFormats(COKitDocumentType docType)
+{
+    std::vector<COMDLG_FILTERSPEC> result;
+
+    if (docType == COKitDocumentType::TEXT)
+    {
+        result.push_back({L"ODT", L"*.odt"});
+        result.push_back({L"RTF", L"*.rtf"});
+        result.push_back({L"DOCX", L"*.docx"});
+        result.push_back({L"DOC", L"*.doc"});
+    }
+    else if (docType == COKitDocumentType::SPREADSHEET)
+    {
+        result.push_back({L"ODS", L"*.ods"});
+        result.push_back({L"XLSX", L"*.xlsx"});
+        result.push_back({L"XLS", L"*.xls"});
+    }
+    else if (docType == COKitDocumentType::PRESENTATION)
+    {
+        result.push_back({L"ODP", L"*.odp"});
+        result.push_back({L"PPTX", L"*.pptx"});
+        result.push_back({L"PPT", L"*.ppt"});
+    }
+    else if (docType == COKitDocumentType::DRAWING)
+    {
+        result.push_back({L"ODG", L"*.odg"});
+    }
+
+    return result;
+}
+
+static FilenameAndUri fileSaveDialog(HWND hWnd,
+                                     const std::string& name,
+                                     const std::string& folder,
+                                     const std::vector<COMDLG_FILTERSPEC>& extensions,
+                                     size_t defaultTypeIndex)
+{
+    IFileSaveDialog* dialog;
+
+    if (!SUCCEEDED(CoCreateInstance(CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER,
+                                    IID_IFileSaveDialog, reinterpret_cast<void**>(&dialog))))
+        fatal("CoCreateInstance(CLSID_FileSaveDialog) failed");
+
+    FILEOPENDIALOGOPTIONS options;
+
+    if (!SUCCEEDED(dialog->GetOptions(&options)))
+        fatal("dialog->GetOptions() failed");
+
+    options |= FOS_STRICTFILETYPES;
+
+    if (!SUCCEEDED(dialog->SetOptions(options)))
+        fatal("dialog->SetOptions() failed");
+
+    if (extensions.size() > 0)
+    {
+        if (defaultTypeIndex >= extensions.size())
+            defaultTypeIndex = 0;
+
+        // The default extension is given without the leading "*." of the filter pattern.
+        std::wstring defaultExtension = extensions[defaultTypeIndex].pszSpec;
+        if (defaultExtension.starts_with(L"*."))
+            defaultExtension = defaultExtension.substr(2);
+        if (!SUCCEEDED(dialog->SetDefaultExtension(defaultExtension.c_str())))
+            fatal("dialog->SetDefaultExtension() failed");
+
+        if (!SUCCEEDED(dialog->SetFileTypes(extensions.size(), extensions.data())))
+            fatal("dialog->SetFileTypes() failed");
+
+        // The file type index of the dialog starts at 1.
+        if (!SUCCEEDED(dialog->SetFileTypeIndex(static_cast<UINT>(defaultTypeIndex + 1))))
+            fatal("dialog->SetFileTypeIndex() failed");
+    }
+
+    if (name != "" && !SUCCEEDED(dialog->SetFileName(Util::string_to_wide_string(name).c_str())))
+        fatal("dialog->SetFileName() failed");
+
+    if (folder != "")
+    {
+        std::wstring wfolder = Util::string_to_wide_string(folder);
+        std::replace(wfolder.begin(), wfolder.end(), L'/', L'\\');
+
+        IShellItem* psiFolder;
+        if (SUCCEEDED(SHCreateItemFromParsingName(wfolder.c_str(), nullptr, IID_PPV_ARGS(&psiFolder))))
+        {
+            if (!SUCCEEDED(dialog->SetFolder(psiFolder)))
+                fatal("dialog->SetFolder() failed");
+            psiFolder->Release();
+        }
+    }
+
+    if (!SUCCEEDED(dialog->Show(hWnd)))
+        return {};
+
+    IShellItem* item;
+    if (!SUCCEEDED(dialog->GetResult(&item)))
+        fatal("dialog->GetResult() failed");
+
+    PWSTR fileSysPath;
+    if (!SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &fileSysPath)))
+        fatal("item->GetDisplayName() failed");
+
+    auto path = Poco::Path(Util::wide_string_to_string(std::wstring(fileSysPath)));
+    CoTaskMemFree(fileSysPath);
+    item->Release();
+    dialog->Release();
+
+    return { path.getFileName(), pathToURI(path) };
+}
+
+static void arrangePresentationWindows(DocumentTab& data)
+{
+    WindowState* presentationWindow = findWindow(data.hWnd);
+    if (!presentationWindow)
+        return;
+    WindowState* consoleWindow = data.hConsoleWnd ? findWindow(data.hConsoleWnd) : nullptr;
+
+    Monitors monitors(getMonitors());
+    presentationWindow->numMonitors = monitors.size();
+
+    HMONITOR laptopMonitor = 0;
+    HMONITOR externalMonitor = 0;
+
+    for (const auto& monitor : monitors)
+    {
+        if (monitor.dwFlags & MONITORINFOF_PRIMARY)
+        {
+            if (!laptopMonitor)
+                laptopMonitor = monitor.hMonitor;
+        }
+        else
+        {
+            if (!externalMonitor)
+                externalMonitor = monitor.hMonitor;
+        }
+    }
+
+    if (!laptopMonitor || !externalMonitor)
+    {
+        laptopMonitor = MonitorFromWindow(data.hWnd, MONITOR_DEFAULTTONEAREST);
+        externalMonitor = 0;
+        for (const auto& monitor : monitors)
+        {
+            if (monitor.hMonitor != laptopMonitor)
+            {
+                externalMonitor = monitor.hMonitor;
+                break;
+            }
+        }
+    }
+
+    leave_full_screen(*presentationWindow);
+    if (consoleWindow)
+        leave_full_screen(*consoleWindow);
+
+    HMONITOR presenterMonitor = externalMonitor ? externalMonitor : laptopMonitor;
+
+    enter_full_screen(*presentationWindow, presenterMonitor, true);
+
+    if (consoleWindow)
+    {
+        if (externalMonitor)
+            enter_full_screen(*consoleWindow, laptopMonitor, true);
+        else
+            BringWindowToTop(data.hConsoleWnd);
+    }
+}
+
+// The MIME type that Windows has registered for the extension of the given file name, or an empty
+// string when the extension is unknown. This is the same registry entry that the shell and the
+// WebView2 read, so a file dropped on the app gets the same MIME type that the web content would
+// have seen for it.
+static std::string mimeTypeForFileName(const std::string& filename)
+{
+    const auto lastPeriod = filename.find_last_of('.');
+    if (lastPeriod == std::string::npos)
+        return "";
+
+    const std::wstring extension = Util::string_to_wide_string(filename.substr(lastPeriod));
+
+    wchar_t mimeType[200];
+    DWORD numChars = sizeof(mimeType) / sizeof(mimeType[0]);
+    if (AssocQueryStringW(ASSOCF_NONE, ASSOCSTR_CONTENTTYPE, extension.c_str(), nullptr, mimeType,
+                          &numChars) != S_OK)
+        return "";
+
+    return Util::wide_string_to_string(std::wstring(mimeType));
+}
+
+// True for the files that go into a document instead of being opened as a document of their own.
+// Images and media are what the document can hold, and what the browser side already knows how to
+// insert.
+static bool isInsertableIntoDocument(const std::string& mimeType)
+{
+    return mimeType.starts_with("image/") || mimeType.starts_with("audio/") ||
+        mimeType.starts_with("video/");
+}
+
+// Hand a dropped image or media file to the JS, so that it ends up in the document the same way as
+// a file dropped straight onto the document view used to. The bytes travel as base64 in a posted
+// web message, because the bridge to the JavaScript carries strings only. The drop point travels
+// with them, in physical pixels relative to the window client area, so that the insert can happen
+// where the user aimed.
+static void insertDroppedFile(HWND hWnd, int tabId, const std::string& path,
+                              const std::string& mimeType, const POINT& point)
+{
+    const std::string filename = Poco::Path(path).getFileName();
+
+    std::ifstream stream;
+    FileUtil::openFileToIFStream(path, stream, std::ios_base::in | std::ios_base::binary);
+    if (!stream.is_open())
+    {
+        LOG_ERR("Cannot open dropped file [" << path << "]");
+        return;
+    }
+
+    const std::vector<char> contents((std::istreambuf_iterator<char>(stream)),
+                                     std::istreambuf_iterator<char>());
+    if (contents.empty())
+        return;
+
+    // The whole file becomes one base64 string, and its length has to fit in the DWORD that
+    // CryptBinaryToStringA counts characters in.
+    constexpr size_t maxSize = 256 * 1024 * 1024;
+    if (contents.size() > maxSize)
+    {
+        LOG_ERR("Dropped file [" << filename << "] is too large to insert, " << contents.size()
+                                 << " bytes");
+        return;
+    }
+
+    // Four base64 characters for every three bytes, rounded up, and room for the terminating NUL
+    // character.
+    DWORD base64Length = static_cast<DWORD>((contents.size() + 2) / 3 * 4 + 8);
+    std::vector<char> base64(base64Length);
+    if (!CryptBinaryToStringA((BYTE*)contents.data(), static_cast<DWORD>(contents.size()),
+                              CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, base64.data(),
+                              &base64Length))
+    {
+        const auto error = GetLastError();
+        LOG_ERR("CryptBinaryToStringA failed: " << error);
+        return;
+    }
+
+    Poco::JSON::Object::Ptr message = new Poco::JSON::Object();
+    message->set("command", "insertdroppedfile");
+    message->set("name", filename);
+    message->set("mimetype", mimeType);
+    message->set("data", std::string(base64.data()));
+    message->set("x", point.x);
+    message->set("y", point.y);
+    std::ostringstream oss;
+    message->stringify(oss);
+
+    PostMessageW(hWnd, CODA_WM_POSTWEBMESSAGE, (WPARAM)_strdup(oss.str().c_str()), (LPARAM)tabId);
+}
+
+static void hideDropOverlay(WindowState& data);
+
+// The timer that watches for a drag that goes away without the overlay hearing about it.
+static const int TIMER_ID_DROP_OVERLAY = 1;
+// The timer of a tabbed window that holds the pending run of the live-view limit.
+static const int TIMER_ID_LIVE_VIEW_LIMIT = 2;
+// The timer of a tabbed window that holds the pending build of the WebView2 of the tab on show.
+static const int TIMER_ID_VIEW_RESTORE = 3;
+
+// The pathnames in a CF_HDROP file list, in their order there.
+static std::vector<std::wstring> pathsInFileList(HDROP drop)
+{
+    std::vector<std::wstring> paths;
+    const UINT numFiles = DragQueryFileW(drop, 0xFFFFFFFF, NULL, 0);
+    for (UINT i = 0; i < numFiles; i++)
+    {
+        // The length returned does not count the terminating NUL character, so the buffer needs
+        // one more.
+        const UINT length = DragQueryFileW(drop, i, NULL, 0);
+        if (length == 0)
+            continue;
+
+        std::wstring path(length + 1, L'\0');
+        if (DragQueryFileW(drop, i, path.data(), length + 1) == 0)
+            continue;
+        path.resize(length);
+        paths.push_back(std::move(path));
+    }
+    return paths;
+}
+
+// Deal with the files in a drop, whether it arrived as a WM_DROPFILES message or through the drop
+// target of the overlay window. An image or media file goes into the document, everything else
+// becomes one more document to open: the first one opens right away, the rest follow one by one as
+// each preceding document finishes loading. The drop point is in client coordinates, and negative
+// when the drop happened outside the client area, on the window frame, in which case the file goes
+// in at the cursor.
+static void handleDroppedFiles(HWND hWnd, HDROP drop, const POINT& dropPoint)
+{
+    // The starter backstage window, the welcome slideshow and the presenter console show no
+    // document to insert into, so everything dropped on them opens as a document. In the tabbed
+    // window the drop goes to the document on show.
+    WindowState* window = findWindow(hWnd);
+    DocumentTab* tab = window ? activeTabOf(*window) : nullptr;
+    const bool canInsert = tab && tab->mode == DocumentMode::EDIT && !tab->isConsole;
+
+    // The document view starts below the tab strip, and the page places the insert relative to
+    // its own top left corner. A drop on the window frame arrives negative and stays that way,
+    // which puts the insert at the cursor instead.
+    // The client coordinates of a mirrored window run from the right, and the page measures from
+    // the left.
+    POINT documentPoint = dropPoint;
+    if (window && documentPoint.x >= 0 && documentPoint.y >= 0)
+    {
+        const RECT area = documentArea(*window);
+        const bool mirrored = (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_LAYOUTRTL) != 0;
+        documentPoint.x = mirrored ? area.right - documentPoint.x : documentPoint.x - area.left;
+        documentPoint.y -= area.top;
+    }
+
+    bool anyDocumentToOpen = false;
+    for (const std::wstring& droppedPath : pathsInFileList(drop))
+    {
+        auto path = Poco::Path(Util::wide_string_to_string(droppedPath));
+        const std::string mimeType = mimeTypeForFileName(path.getFileName());
+
+        if (canInsert && isInsertableIntoDocument(mimeType))
+        {
+            insertDroppedFile(hWnd, tab->tabId, path.toString(), mimeType, documentPoint);
+            continue;
+        }
+
+        filenamesAndUrisToOpen.push_back({ path.getFileName(), pathToURI(path) });
+        anyDocumentToOpen = true;
+    }
+
+    if (anyDocumentToOpen)
+        load_next_document();
+}
+
+// The drop target of the overlay window. Windows looks for a drop target by hit-testing the window
+// under the pointer, so this one gets the drops that would otherwise go to the web view.
+class FileDropTarget final : public IDropTarget
+{
+public:
+    FileDropTarget(HWND hWnd)
+        : m_hWnd(hWnd)
+    {
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override
+    {
+        if (riid == IID_IUnknown || riid == IID_IDropTarget)
+        {
+            *object = static_cast<IDropTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *object = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&m_referenceCount); }
+
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        const LONG count = InterlockedDecrement(&m_referenceCount);
+        if (count == 0)
+            delete this;
+        return count;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* dataObject, DWORD, POINTL,
+                                        DWORD* effect) override
+    {
+        m_hasFiles = holdsFileList(dataObject);
+        *effect = m_hasFiles ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL, DWORD* effect) override
+    {
+        *effect = m_hasFiles ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE DragLeave() override
+    {
+        if (WindowState* window = findWindow(m_hWnd))
+            hideDropOverlay(*window);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* dataObject, DWORD, POINTL point,
+                                   DWORD* effect) override
+    {
+        *effect = DROPEFFECT_NONE;
+        if (WindowState* window = findWindow(m_hWnd))
+            hideDropOverlay(*window);
+
+        FORMATETC format = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        STGMEDIUM medium;
+        if (dataObject->GetData(&format, &medium) != S_OK)
+            return S_OK;
+
+        // The drop point comes in screen coordinates, and the overlay covers the client area of the
+        // document window, so the client coordinates of the window are what the document sees.
+        POINT clientPoint = { point.x, point.y };
+        ScreenToClient(m_hWnd, &clientPoint);
+
+        handleDroppedFiles(m_hWnd, static_cast<HDROP>(medium.hGlobal), clientPoint);
+        ReleaseStgMedium(&medium);
+
+        *effect = DROPEFFECT_COPY;
+        return S_OK;
+    }
+
+private:
+    static bool holdsFileList(IDataObject* dataObject)
+    {
+        FORMATETC format = { CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+        return dataObject && dataObject->QueryGetData(&format) == S_OK;
+    }
+
+    HWND m_hWnd;
+    LONG m_referenceCount = 1;
+    bool m_hasFiles = false;
+};
+
+// The web view covers the whole client area and takes any drop there itself, so a file dropped on
+// the document view never reaches the app. Raising this transparent window over the web view for as
+// long as the drag lasts is what brings the drop to the app, with the paths of the dropped files.
+// The web view reports the arriving drag, as it still sees the drag events until the overlay covers
+// it.
+static void showDropOverlay(WindowState& data)
+{
+    // Where the document view of the window is on the screen. The overlay is a window of its own
+    // rather than a child window, because only a top-level window can be made transparent with a
+    // layer, and it is owned by the document window, which keeps it above that window and takes it
+    // away when the document window goes. It stops short of the tab strip, which takes its own
+    // drags.
+    // With exactly two points, MapWindowPoints() keeps left less than right also when it maps out
+    // of a mirrored window.
+    RECT bounds = documentArea(data);
+    MapWindowPoints(data.hWnd, HWND_DESKTOP, reinterpret_cast<POINT*>(&bounds), 2);
+    const int width = bounds.right - bounds.left;
+    const int height = bounds.bottom - bounds.top;
+    const POINT topLeft = { bounds.left, bounds.top };
+
+    if (!data.hOverlayWnd)
+    {
+        data.hOverlayWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                           overlayWindowClass, L"", WS_POPUP, topLeft.x, topLeft.y,
+                                           width, height, data.hWnd, NULL,
+                                           appInstance, NULL);
+        if (!data.hOverlayWnd)
+        {
+            const auto error = GetLastError();
+            LOG_ERR("CreateWindowExW() for the drop overlay failed: " << error
+                                                                      << ", owner window "
+                                                                      << data.hWnd << ", size "
+                                                                      << width << "x"
+                                                                      << height);
+            return;
+        }
+
+        // Just short of fully transparent. The window has to be visible to be hit-tested as a drop
+        // target, but the document has to stay readable under it.
+        if (!SetLayeredWindowAttributes(data.hOverlayWnd, 0, 1, LWA_ALPHA))
+        {
+            const auto error = GetLastError();
+            LOG_ERR("SetLayeredWindowAttributes() for the drop overlay failed: " << error);
+        }
+
+        data.dropTarget = new FileDropTarget(data.hWnd);
+        const HRESULT hr = RegisterDragDrop(data.hOverlayWnd, data.dropTarget);
+        if (hr != S_OK)
+        {
+            LOG_ERR("RegisterDragDrop() failed: " << hr);
+            data.dropTarget->Release();
+            data.dropTarget = nullptr;
+            DestroyWindow(data.hOverlayWnd);
+            data.hOverlayWnd = 0;
+            return;
+        }
+    }
+
+    SetWindowPos(data.hOverlayWnd, HWND_TOP, topLeft.x, topLeft.y, width, height,
+                 SWP_SHOWWINDOW | SWP_NOACTIVATE);
+
+    SetTimer(data.hWnd, TIMER_ID_DROP_OVERLAY, 500, NULL);
+}
+
+static void hideDropOverlay(WindowState& data)
+{
+    if (!data.hOverlayWnd)
+        return;
+
+    KillTimer(data.hWnd, TIMER_ID_DROP_OVERLAY);
+    ShowWindow(data.hOverlayWnd, SW_HIDE);
+}
+
+// A drag that ends on the overlay takes the overlay away with it, and so does one that leaves it.
+// A drag can also pass over the web view and be gone again before the overlay is up, and then
+// nothing else would ever take it away, and it would sit in front of the document and swallow the
+// input meant for it. A drag holds a mouse button down, so the button coming up says the drag is
+// over, whether the overlay saw any of it or not.
+static void checkDropOverlayStillNeeded(WindowState& data)
+{
+    const bool buttonIsDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) ||
+        (GetAsyncKeyState(VK_RBUTTON) & 0x8000);
+
+    if (!buttonIsDown)
+        hideDropOverlay(data);
+}
+
+static void destroyDropOverlay(WindowState& data)
+{
+    if (!data.hOverlayWnd)
+        return;
+
+    RevokeDragDrop(data.hOverlayWnd);
+    data.dropTarget->Release();
+    data.dropTarget = nullptr;
+    DestroyWindow(data.hOverlayWnd);
+    data.hOverlayWnd = 0;
+}
+
+// Identifier for the Ctrl+Shift+I hotkey that opens the WebView2 developer
+// tools. The range 0x0000 to 0xBFFF is reserved for application hotkeys.
+static const int HOTKEY_ID_DEVTOOLS = 0x00DA;
+
+// Window procedure for a hidden window used as clipboard owner. It lives for the whole app run, so
+// its delayed-render promise only has to be materialized (WM_RENDERALLFORMATS) once, when the app
+// exits, not when an individual document window closes. Also used as parent window for the file
+// open and save dialogs, and to open the documents waiting in filenamesAndUrisToOpen one at a time.
+static LRESULT CALLBACK HiddenOwnerWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+        case WM_RENDERFORMAT:
+        {
+            UINT format = (UINT)wParam;
+            std::string mimeType = MIME_type_for_clipboard_format(format);
+            if (!mimeType.empty())
+            {
+                HANDLE hData = copyEngineClipboardData(format, mimeType);
+                if (hData)
+                    SetClipboardData(format, hData);
+            }
+            return 0;
+        }
+
+        case WM_RENDERALLFORMATS:
+            // This window is about to be destroyed (the app is exiting) while it still owns the
+            // clipboard with formats it only promised. Render them all now, so the content outlives
+            // the app. The engine still holds the one shared clipboard, so the bytes are available.
+            materialize_clipboard_formats();
+            return 0;
+
+        case WM_DESTROYCLIPBOARD:
+            weOwnTheClipboard = false;
+            return 0;
+
+        case CODA_WM_SHOWFILEPICKER:
+        {
+            // The engine asked for a file (see filePickerProviderPick). Show the open
+            // dialog here on the UI thread and answer the engine's completion; the
+            // engine's main loop keeps running while the dialog is open.
+            std::unique_ptr<FilePickerRequest> request(
+                reinterpret_cast<FilePickerRequest*>(wParam));
+
+            std::vector<COMDLG_FILTERSPEC> filterSpecs;
+            for (auto const& f : request->filters)
+                filterSpecs.push_back({ f.first.c_str(), f.second.c_str() });
+
+            const HWND foreground = GetForegroundWindow();
+            const HWND owner = findWindow(foreground) ? foreground : hiddenOwnerWindow;
+            auto openResult = fileOpenDialog(owner, request->title, filterSpecs, false);
+            if (!openResult.empty())
+                request->pfnPicked(request->pContext, openResult[0].uri.c_str());
+            else
+                request->pfnPicked(request->pContext, nullptr);
+            return 0;
+        }
+
+        case CODA_WM_LOADNEXTDOCUMENT:
+            if (filenamesAndUrisToOpen.size() > 0)
+            {
+                auto nextDocument = filenamesAndUrisToOpen.front();
+                filenamesAndUrisToOpen.pop_front();
+                openCOOLWindow(nextDocument, DocumentMode::EDIT);
+            }
+            return 0;
+    }
+    return DefWindowProc(hWnd, message, wParam, lParam);
+}
+
+static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    // The system draws the caption buttons of a window with the strip in its title bar, and it
+    // handles the mouse over them. WM_NCHITTEST asks it below, after the top resize border.
+    WindowState* frameWindow = findWindow(hWnd);
+    if (frameWindow && hasStripInTitleBar(*frameWindow) && message != WM_NCHITTEST)
+    {
+        LRESULT result;
+        if (DwmDefWindowProc(hWnd, message, wParam, lParam, &result))
+            return result;
+    }
+
+    switch (message)
+    {
+        case WM_NCCALCSIZE:
+        {
+            if (!wParam || !frameWindow || !hasStripInTitleBar(*frameWindow))
+                return DefWindowProc(hWnd, message, wParam, lParam);
+
+            // The client area takes the place of the title bar and of the resize border above it,
+            // and the system keeps the borders at the sides and at the bottom. The client area
+            // starts at the top of the window also in a maximized window, which reaches above the
+            // screen by the height of that border. DWM places the caption buttons from the top of
+            // the window in both cases.
+            NCCALCSIZE_PARAMS* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+            const LONG top = params->rgrc[0].top;
+            const LRESULT result = DefWindowProc(hWnd, message, wParam, lParam);
+            params->rgrc[0].top = top;
+            return result;
+        }
+
+        case WM_NCHITTEST:
+        {
+            const LRESULT result = DefWindowProc(hWnd, message, wParam, lParam);
+            if (result != HTCLIENT || !frameWindow || !hasStripInTitleBar(*frameWindow))
+                return result;
+
+            // The strip takes the clicks on itself, so what comes here is the top resize border,
+            // the caption buttons, or the part of the title bar between the strip and the
+            // buttons. The resize border reaches over the buttons, as on a normal title bar.
+            POINT point = { static_cast<short>(LOWORD(lParam)),
+                            static_cast<short>(HIWORD(lParam)) };
+            ScreenToClient(hWnd, &point);
+            RECT client;
+            GetClientRect(hWnd, &client);
+            const int border = topResizeBorderHeight(hWnd);
+            if (!IsZoomed(hWnd) && point.y < border)
+            {
+                // The hit test codes name the sides of the screen, also in a mirrored window,
+                // whose client coordinates run from the right.
+                const bool mirrored = (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_LAYOUTRTL) != 0;
+                if (point.x < border)
+                    return mirrored ? HTTOPRIGHT : HTTOPLEFT;
+                if (point.x >= client.right - border)
+                    return mirrored ? HTTOPLEFT : HTTOPRIGHT;
+                return HTTOP;
+            }
+            LRESULT buttonResult;
+            if (DwmDefWindowProc(hWnd, message, wParam, lParam, &buttonResult))
+                return buttonResult;
+            if (point.y < titleBarFrameHeight(*frameWindow))
+                return HTCAPTION;
+            return HTCLIENT;
+        }
+
+        case WM_PAINT:
+        {
+            if (!frameWindow || !hasStripInTitleBar(*frameWindow))
+                return DefWindowProc(hWnd, message, wParam, lParam);
+
+            // Black is clear in the frame that DWM extends into the client area, so the frame and
+            // the caption buttons show around the strip.
+            PAINTSTRUCT paint;
+            HDC dc = BeginPaint(hWnd, &paint);
+            RECT frame;
+            GetClientRect(hWnd, &frame);
+            frame.bottom =
+                std::min(frame.bottom, static_cast<LONG>(titleBarFrameHeight(*frameWindow)));
+            FillRect(dc, &frame, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            EndPaint(hWnd, &paint);
+            return 0;
+        }
+
+        case WM_CREATE:
+            {
+                // Accept files dragged from Explorer onto the window, which arrive as WM_DROPFILES.
+                DragAcceptFiles(hWnd, TRUE);
+
+                // Set the title bar before the window is shown, so it is never drawn in the wrong
+                // theme first.
+                applyTitleBarTheme(hWnd);
+
+                // Contrary to documentation, when you use CW_USEDEFAULT for the x and y parameters
+                // in the CreateWindowW() call, Windows will occasionally place the window so that
+                // it is partially obscured by the taskbar. Workaround for that.
+
+                MONITORINFO monitorInfo;
+                monitorInfo.cbSize = sizeof(monitorInfo);
+                GetMonitorInfoW(MonitorFromWindow(hWnd, MONITOR_DEFAULTTOPRIMARY), &monitorInfo);
+
+                CREATESTRUCT *cs = (CREATESTRUCT *)lParam;
+
+                int x = cs->x, y = cs->y;
+
+                if (cs->cx < (monitorInfo.rcWork.right - monitorInfo.rcWork.left))
+                {
+                    if (cs->x < monitorInfo.rcWork.left)
+                    {
+                        // Left edge obscured by taskbar at the left. Move window right by the width
+                        // of the taskbar.
+                        x = cs->x + (monitorInfo.rcWork.left - monitorInfo.rcMonitor.left);
+                    } else if (cs->x + cs->cx > monitorInfo.rcWork.right)
+                    {
+                        // Left edge obscured by taskbar at the right. Move window left.
+                        x = cs->x - (monitorInfo.rcMonitor.right - monitorInfo.rcWork.right);
+                    }
+                }
+                if (cs->cy < (monitorInfo.rcWork.bottom - monitorInfo.rcWork.top))
+                {
+                    if (cs->y < monitorInfo.rcWork.top)
+                    {
+                        // Top edge obscured by taskbar at the top. Move window down by the height
+                        // of the taskbar.
+                        y = cs->y + (monitorInfo.rcWork.top - monitorInfo.rcMonitor.top);
+                    } else if (cs->y + cs->cy > monitorInfo.rcWork.bottom)
+                    {
+                        // Bottom edge obscured by taskbar at the bottom. Move window up.
+                        y = cs->y - (monitorInfo.rcMonitor.bottom - monitorInfo.rcWork.bottom);
+                    }
+                }
+
+                if (x != cs->x || y != cs->y)
+                    SetWindowPos(hWnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+                return 0;
+            }
+
+        case WM_SIZING:
+            {
+                int minimumWidth = 1000, minimumHeight = 800;
+
+                HMONITOR monitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO monitorInfo;
+                monitorInfo.cbSize = sizeof(monitorInfo);
+                if (GetMonitorInfoW(monitor, &monitorInfo))
+                {
+                    // If the monitor has a "reasonable" aspect ratio (1:1 to 2:1) (taking into
+                    // account it might be in landscape or portrait orientation), set minimum width
+                    // to a quarter of monitor width and minimum height to a third of monitior
+                    // height. (Because COOL requires more essential space in the vertical
+                    // direction, I think.)
+                    double aspectRatio =
+                        (double)(monitorInfo.rcWork.right - monitorInfo.rcWork.left) / (monitorInfo.rcWork.bottom - monitorInfo.rcWork.top);
+                    if (aspectRatio >= 0.49 && aspectRatio <= 2.01)
+                    {
+                        // Reasonable case
+                        minimumWidth = (monitorInfo.rcWork.right - monitorInfo.rcWork.left) / 4;
+                        minimumHeight = (monitorInfo.rcWork.bottom - monitorInfo.rcWork.top) / 3;
+                    }
+                    else if (aspectRatio < 0.49)
+                    {
+                        // Very narrow, set just minimum height
+                        minimumHeight = (monitorInfo.rcWork.bottom - monitorInfo.rcWork.top) / 3;
+                    }
+                    else if (aspectRatio > 2.01)
+                    {
+                        // Very wide, set just minimum width
+                        minimumWidth = (monitorInfo.rcWork.right - monitorInfo.rcWork.left) / 4;
+                    }
+                }
+
+                RECT* rect = (RECT*)lParam;
+                if (rect->right - rect->left < minimumWidth)
+                {
+                    switch (wParam)
+                    {
+                        case WMSZ_LEFT:
+                        case WMSZ_TOPLEFT:
+                        case WMSZ_BOTTOMLEFT:
+                            rect->left = rect->right - minimumWidth;
+                            break;
+                        case WMSZ_RIGHT:
+                        case WMSZ_TOPRIGHT:
+                        case WMSZ_BOTTOMRIGHT:
+                            rect->right = rect->left + minimumWidth;
+                            break;
+                        case WMSZ_TOP:
+                        case WMSZ_BOTTOM:
+                            {
+                                // Weird case, resizing height but still the width goes below the
+                                // minimum? Grow width on both sizes.
+                                auto mid = (rect->left + rect->right) / 2;
+                                rect->left = mid - minimumWidth/2;
+                                rect->right = rect->left + minimumWidth;
+                            }
+                            break;
+                    }
+                }
+                if (rect->bottom - rect->top < minimumHeight)
+                {
+                    switch (wParam)
+                    {
+                        case WMSZ_TOP:
+                        case WMSZ_TOPLEFT:
+                        case WMSZ_TOPRIGHT:
+                            rect->top = rect->bottom - minimumHeight;
+                            break;
+                        case WMSZ_BOTTOM:
+                        case WMSZ_BOTTOMLEFT:
+                        case WMSZ_BOTTOMRIGHT:
+                            rect->bottom = rect->top + minimumHeight;
+                            break;
+                        case WMSZ_LEFT:
+                        case WMSZ_RIGHT:
+                            {
+                                // Weird case, resizing width but still the height goes below the
+                                // minimum? Grow height on both sizes.
+                                auto mid = (rect->top + rect->bottom) / 2;
+                                rect->top = mid - minimumHeight/2;
+                                rect->bottom = rect->top + minimumHeight;
+                            }
+                            break;
+                    }
+                }
+            }
+            return TRUE;
+
+        case WM_SIZE:
+            if (WindowState* window = findWindow(hWnd))
+                layoutTabs(*window);
+            break;
+
+        case WM_SETFOCUS:
+            if (WindowState* window = findWindow(hWnd))
+            {
+                DocumentTab* tab = activeTabOf(*window);
+                if (tab && tab->webViewController)
+                    tab->webViewController->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+            }
+            break;
+
+        case WM_DPICHANGED:
+        {
+            const RECT* newRect = (RECT*)lParam;
+            SetWindowPos(hWnd, NULL, newRect->left, newRect->top, newRect->right - newRect->left,
+                         newRect->bottom - newRect->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        break;
+
+        case WM_DISPLAYCHANGE:
+        {
+            WindowState* window = findWindow(hWnd);
+            DocumentTab* tab = window ? activeTabOf(*window) : nullptr;
+            if (tab && (tab->hConsoleWnd || window->isPresFullScreen))
+            {
+                int numMonitors = getMonitors().size();
+                if (window->numMonitors != numMonitors)
+                    arrangePresentationWindows(*tab);
+            }
+        }
+        break;
+
+        case WM_SETTINGCHANGE:
+            // Take into account the systme theme changes and use that for the titlebar in
+            // case the in-app theme preference is not set. `applyTitleBarThemeToAllWindows`
+            // need not be called since each window receives this message.
+            if (lParam && wcscmp((const wchar_t*)lParam, L"ImmersiveColorSet") == 0)
+                applyTitleBarTheme(hWnd);
+        break;
+
+        case WM_CLOSE:
+        {
+            WindowState* window = findWindow(hWnd);
+            if (window && !window->tabIds.empty())
+            {
+                // Each document gets the close it would get if it were the only one here, one
+                // after the other, and the last one takes the window with it.
+                window->closingAll = true;
+                requestCloseTab(hWnd, window->tabIds.front());
+                break;
+            }
+            DestroyWindow(hWnd);
+            break;
+        }
+
+        case WM_DESTROY:
+            if (WindowState* window = findWindow(hWnd))
+            {
+                destroyDropOverlay(*window);
+                // The kits drop the documents' data later, so count the windows.
+                if (windows.size() == 1)
+                    stopServer();
+            }
+            break;
+
+        case WM_NCDESTROY:
+        {
+            WindowState* window = findWindow(hWnd);
+            if (window)
+            {
+                if (window->stripController)
+                {
+                    window->stripController->Close();
+                    window->stripController = nullptr;
+                }
+                window->stripWebView = nullptr;
+                windows.erase(hWnd);
+                // New documents go to another tabbed window, if there is one left.
+                if (tabbedWindow == hWnd)
+                {
+                    tabbedWindow = 0;
+                    for (const auto& i : windows)
+                    {
+                        if (i.second.isTabbed)
+                        {
+                            tabbedWindow = i.first;
+                            break;
+                        }
+                    }
+                }
+            }
+            break;
+        }
+
+        case CODA_WM_EXECUTESCRIPT:
+        {
+            DocumentTab* tab = findTab((int)lParam);
+            if (tab && tab->editorFrame)
+                tab->editorFrame->ExecuteScript(
+                    Util::string_to_wide_string(std::string((char*)wParam)).c_str(), nullptr);
+            else if (tab && tab->webView)
+                tab->webView->ExecuteScript(
+                    Util::string_to_wide_string(std::string((char*)wParam)).c_str(),
+                    Microsoft::WRL::Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+                        [](HRESULT errorCode, LPCWSTR resultObjectAsJson) -> HRESULT
+                        {
+                            // LOG_TRC(Util::wide_string_to_string(resultObjectAsJson));
+                            return S_OK;
+                        })
+                        .Get());
+            std::free((char*)wParam);
+            break;
+        }
+
+        case CODA_WM_POSTWEBMESSAGE:
+        {
+            DocumentTab* tab = findTab((int)lParam);
+            if (tab && tab->editorFrame)
+                tab->editorFrame->PostWebMessageAsJson(
+                    Util::string_to_wide_string(std::string((char*)wParam)).c_str());
+            else if (tab && tab->webView)
+                tab->webView->PostWebMessageAsJson(
+                    Util::string_to_wide_string(std::string((char*)wParam)).c_str());
+            std::free((char*)wParam);
+            break;
+        }
+
+        case CODA_WM_CLOSETAB:
+        {
+            // The document can have moved to another window since the close was posted.
+            DocumentTab* tab = findTab((int)wParam);
+            WindowState* window = tab ? findWindow(tab->hWnd) : nullptr;
+            if (!window)
+                break;
+            // A close of some other document than the next one in line is not part of closing
+            // the whole window.
+            if (window->tabIds.empty() || window->tabIds.front() != (int)wParam)
+                window->closingAll = false;
+            requestCloseTab(window->hWnd, (int)wParam);
+            break;
+        }
+
+        case CODA_WM_ACTIVATEADJACENTTAB:
+        {
+            if (WindowState* window = findWindow(hWnd))
+                activateAdjacentTab(*window, (int)wParam);
+            break;
+        }
+
+        case CODA_WM_SHOWTABMENU:
+            showTabContextMenu(hWnd, (int)wParam,
+                               { (short)LOWORD(lParam), (short)HIWORD(lParam) });
+            break;
+
+        case CODA_WM_MOVETABTONEWWINDOW:
+        {
+            const POINT point = { (short)LOWORD(lParam), (short)HIWORD(lParam) };
+            moveTabToNewWindow(hWnd, (int)wParam, &point);
+            break;
+        }
+
+        case CODA_WM_MOVETABTOWINDOW:
+        {
+            if (WindowState* window = findWindow(hWnd))
+                moveTabToWindow((int)wParam, *window, (int)lParam);
+            break;
+        }
+
+        case WM_TIMER:
+            if (wParam == TIMER_ID_DROP_OVERLAY)
+            {
+                if (WindowState* window = findWindow(hWnd))
+                    checkDropOverlayStillNeeded(*window);
+            }
+            else if (wParam == TIMER_ID_LIVE_VIEW_LIMIT)
+            {
+                KillTimer(hWnd, TIMER_ID_LIVE_VIEW_LIMIT);
+                if (WindowState* window = findWindow(hWnd))
+                    enforceLiveViewLimit(*window);
+            }
+            else if (wParam == TIMER_ID_VIEW_RESTORE)
+            {
+                KillTimer(hWnd, TIMER_ID_VIEW_RESTORE);
+                if (WindowState* window = findWindow(hWnd))
+                    restoreActiveTabView(*window);
+            }
+            else
+                return DefWindowProc(hWnd, message, wParam, lParam);
+            break;
+
+        case WM_DROPFILES:
+        {
+            // This is a drop on the window frame. A drop on the document view goes to the drop
+            // target of the overlay window instead.
+            HDROP drop = (HDROP)wParam;
+
+            POINT dropPoint;
+            if (!DragQueryPoint(drop, &dropPoint))
+                dropPoint = { -1, -1 };
+
+            handleDroppedFiles(hWnd, drop, dropPoint);
+            DragFinish(drop);
+            break;
+        }
+
+        case WM_ACTIVATE:
+            // Hold the developer-tools hotkey only while this window is the
+            // active one, so the key is not taken from other applications and
+            // each window opens the developer tools of the document it shows.
+            if (LOWORD(wParam) == WA_INACTIVE)
+            {
+                UnregisterHotKey(hWnd, HOTKEY_ID_DEVTOOLS);
+                hideHoverCard();
+            }
+            else
+            {
+                RegisterHotKey(hWnd, HOTKEY_ID_DEVTOOLS,
+                               MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'I');
+                // The tabbed window the user worked in last takes the next document opened.
+                const WindowState* window = findWindow(hWnd);
+                if (window && window->isTabbed)
+                    tabbedWindow = hWnd;
+            }
+            break;
+
+        case WM_HOTKEY:
+            if (wParam == HOTKEY_ID_DEVTOOLS)
+            {
+                WindowState* window = findWindow(hWnd);
+                DocumentTab* tab = window ? activeTabOf(*window) : nullptr;
+                if (tab && tab->webView)
+                    tab->webView->OpenDevToolsWindow();
+            }
+            break;
+
+        default:
+            return DefWindowProc(hWnd, message, wParam, lParam);
+            break;
+    }
+
+    return 0;
+}
+
+// From https://stackoverflow.com/questions/51334674/how-to-detect-windows-10-light-dark-mode-in-win32-application
+
+static bool isLightTheme()
+{
+    int value;
+    DWORD cbData = 4;
+    auto res = RegGetValueW(
+        HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"AppsUseLightTheme",
+        RRF_RT_REG_DWORD,
+        NULL,
+        &value,
+        &cbData);
+
+    if (res != ERROR_SUCCESS)
+        return true;
+
+    return value == 1;
+}
+
+static bool darkModeEnabled() { return Desktop::getDarkMode().value_or(!isLightTheme()); }
+
+// Make the native (DWM-drawn) title bar of a window match the effective dark mode. The document UI
+// inside the web view follows the same state through the darkTheme parameter of the cool.html URL.
+static void applyTitleBarTheme(HWND hWnd)
+{
+    const BOOL darkMode = darkModeEnabled() ? TRUE : FALSE;
+    HRESULT hr =
+        DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkMode, sizeof(darkMode));
+    if (!SUCCEEDED(hr))
+    {
+        LOG_DBG("DwmSetWindowAttribute() for a dark title bar failed: " << hr);
+        return;
+    }
+
+    // The frame around the caption buttons of a window with the strip in its title bar has the
+    // background colour of the strip, which is --color-background-dark in the light palette and
+    // --color-background-tabs-group in the dark one. Windows 10 has no caption colour and keeps
+    // its own.
+    const WindowState* window = findWindow(hWnd);
+    if (window && hasStripInTitleBar(*window))
+    {
+        const COLORREF captionColor = darkMode ? RGB(0x30, 0x30, 0x30) : RGB(0xe8, 0xe8, 0xe8);
+        DwmSetWindowAttribute(hWnd, DWMWA_CAPTION_COLOR, &captionColor, sizeof(captionColor));
+    }
+
+    // A window that is already on screen does not necessarily repaint its frame by itself, so ask
+    // for that. Harmless for a window that is not visible yet (during WM_CREATE, say).
+    SetWindowPos(hWnd, NULL, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+// Used when the dark mode changes for the whole application (the web UI asked for it with
+// SETDARKMODE), as opposed to a platform theme change, which each window is told about separately
+// with its own WM_SETTINGCHANGE.
+static void applyTitleBarThemeToAllWindows()
+{
+    for (const auto& i : windows)
+        applyTitleBarTheme(i.second.hWnd);
+}
+
+// A read-only IStream over the bytes [first, first + count) of another stream. WebView2 reads
+// the response body on a thread of its own, after the handler has returned, so the stream is
+// agile (FtmBase).
+class MediaRangeStream final
+    : public Microsoft::WRL::RuntimeClass<
+          Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IStream,
+          Microsoft::WRL::FtmBase>
+{
+public:
+    MediaRangeStream(wil::com_ptr<IStream> source, ULONGLONG first, ULONGLONG count)
+        : _source(std::move(source))
+        , _first(first)
+        , _count(count)
+    {
+    }
+
+    ~MediaRangeStream() override
+    {
+        LOG_DBG_S("Media range " << _first << '-' << (_first + _count - 1) << ": read " << _read
+                                 << " of " << _count << " bytes");
+    }
+
+    HRESULT STDMETHODCALLTYPE Read(void* buffer, ULONG size, ULONG* read) override
+    {
+        ULONG got = 0;
+        const ULONGLONG remaining = _count - _pos;
+        if (size > 0 && remaining > 0)
+        {
+            LARGE_INTEGER at;
+            at.QuadPart = static_cast<LONGLONG>(_first + _pos);
+            HRESULT hr = _source->Seek(at, STREAM_SEEK_SET, nullptr);
+            if (FAILED(hr))
+                return hr;
+            hr = _source->Read(buffer, static_cast<ULONG>(std::min<ULONGLONG>(size, remaining)),
+                               &got);
+            if (FAILED(hr))
+                return hr;
+            _pos += got;
+            _read += got;
+        }
+        if (read)
+            *read = got;
+        return got == size ? S_OK : S_FALSE;
+    }
+
+    HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER move, DWORD origin,
+                                   ULARGE_INTEGER* newPosition) override
+    {
+        LONGLONG base;
+        switch (origin)
+        {
+            case STREAM_SEEK_SET:
+                base = 0;
+                break;
+            case STREAM_SEEK_CUR:
+                base = static_cast<LONGLONG>(_pos);
+                break;
+            case STREAM_SEEK_END:
+                base = static_cast<LONGLONG>(_count);
+                break;
+            default:
+                return STG_E_INVALIDFUNCTION;
+        }
+        const LONGLONG target = base + move.QuadPart;
+        if (target < 0 || static_cast<ULONGLONG>(target) > _count)
+            return STG_E_INVALIDFUNCTION;
+        _pos = static_cast<ULONGLONG>(target);
+        if (newPosition)
+            newPosition->QuadPart = _pos;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Stat(STATSTG* stat, DWORD /*flags*/) override
+    {
+        if (!stat)
+            return STG_E_INVALIDPOINTER;
+        *stat = {};
+        stat->type = STGTY_STREAM;
+        stat->cbSize.QuadPart = _count;
+        stat->grfMode = STGM_READ;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Write(const void*, ULONG, ULONG*) override
+    {
+        return STG_E_ACCESSDENIED;
+    }
+    HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE CopyTo(IStream*, ULARGE_INTEGER, ULARGE_INTEGER*,
+                                     ULARGE_INTEGER*) override
+    {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE Commit(DWORD) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE Revert() override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override
+    {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override
+    {
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE Clone(IStream**) override { return E_NOTIMPL; }
+
+private:
+    wil::com_ptr<IStream> _source;
+    const ULONGLONG _first;
+    const ULONGLONG _count;
+    ULONGLONG _pos = 0;
+    ULONGLONG _read = 0;
+};
+
+// The [first, end) of a "bytes=first-last", "bytes=first-" or "bytes=-count" Range header in a
+// file of the given size, or nothing when the header is malformed or unsatisfiable.
+static std::optional<std::pair<ULONGLONG, ULONGLONG>> parseByteRange(std::string_view header,
+                                                                     ULONGLONG size)
+{
+    constexpr std::string_view prefix = "bytes=";
+    if (!header.starts_with(prefix) || header.find(',') != std::string_view::npos)
+        return std::nullopt;
+    header.remove_prefix(prefix.size());
+
+    const size_t dash = header.find('-');
+    if (dash == std::string_view::npos)
+        return std::nullopt;
+    const std::string_view firstText = header.substr(0, dash);
+    const std::string_view lastText = header.substr(dash + 1);
+
+    // Either side may be empty; a side that is present has to be a number.
+    const auto number = [](std::string_view text)
+    {
+        std::optional<ULONGLONG> result;
+        ULONGLONG value = 0;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+        if (error == std::errc() && end == text.data() + text.size())
+            result = value;
+        return result;
+    };
+    std::optional<ULONGLONG> first, last;
+    if (!firstText.empty() && !(first = number(firstText)))
+        return std::nullopt;
+    if (!lastText.empty() && !(last = number(lastText)))
+        return std::nullopt;
+
+    if (!first && !last)
+        return std::nullopt;
+    if (!first)
+    {
+        // The last *last bytes of the file.
+        if (*last == 0 || size == 0)
+            return std::nullopt;
+        return std::make_pair(*last >= size ? 0 : size - *last, size);
+    }
+    if (*first >= size)
+        return std::nullopt;
+    if (!last)
+        return std::make_pair(*first, size);
+    if (*last < *first)
+        return std::nullopt;
+    return std::make_pair(*first, *last >= size - 1 ? size : *last + 1);
+}
+
+// WebView2 reads an abandoned response stream to its end, so a Range response is capped at
+// this size. Chromium accepts a short 206 on an http(s) URL only, see CODA_MEDIA_HOST.
+constexpr ULONGLONG kMediaResponseChunk = 4 * 1024 * 1024;
+
+// Answers a media request with a status and no body.
+static HRESULT respondWithoutBody(ICoreWebView2Environment* env,
+                                  ICoreWebView2WebResourceRequestedEventArgs* args, int status,
+                                  const wchar_t* reason, const std::wstring& extraHeaders)
+{
+    const std::wstring headers =
+        L"Access-Control-Allow-Origin: *\r\nContent-Length: 0\r\n" + extraHeaders;
+    wil::com_ptr<ICoreWebView2WebResourceResponse> response;
+    HRESULT hr = env->CreateWebResourceResponse(nullptr, status, reason, headers.c_str(),
+                                                &response);
+    if (!SUCCEEDED(hr))
+    {
+        LOG_ERR_S("CreateWebResourceResponse() failed");
+        return hr;
+    }
+    return args->put_Response(response.get());
+}
+
+static HRESULT webResourceRequestedHandler(ICoreWebView2Environment* env,
+                                           ICoreWebView2* sender,
+                                           ICoreWebView2WebResourceRequestedEventArgs* args)
+{
+    wil::com_ptr<ICoreWebView2WebResourceRequest> request;
+    HRESULT hr;
+
+    hr = args->get_Request(&request);
+    if (!SUCCEEDED(hr))
+    {
+        LOG_ERR_S("get_Request() failed");
+        return hr;
+    }
+
+    wil::unique_cotaskmem_string uri;
+    hr = request->get_Uri(&uri);
+    if (!SUCCEEDED(hr))
+    {
+        LOG_ERR_S("get_Uri() failed");
+        return hr;
+    }
+
+    std::string uri2 = Util::wide_string_to_string(uri.get());
+    Poco::URI requestUri(uri2);
+    Poco::URI::QueryParameters params = requestUri.getQueryParameters();
+    std::string wopiSrc, tag;
+
+    // Under the cool: scheme the leading "cool" of the path becomes the host.
+    const std::string& path = requestUri.getPath();
+    const bool isMedia = path == "/media" || path == "/cool/media";
+    const bool isVtt = path == "/mediavtt" || path == "/cool/mediavtt";
+
+    if (!isMedia && !isVtt)
+    {
+        LOG_WRN_S("Unhandled path [" << requestUri.getPath() << ']');
+        return E_FAIL;
+    }
+
+    for (const auto& it : params)
+    {
+        if (it.first == "WOPISrc")
+            wopiSrc = it.second;
+        else if (it.first == "Tag")
+            tag = it.second;
+    }
+
+    if (tag.empty() || wopiSrc.empty())
+    {
+        LOG_ERR_S("Missing WOPISrc or Tag in ["
+                  << uri2 << ']');
+        return E_FAIL;
+    }
+
+    // For some reason for local documents the WOPISrc comes
+    // here with a drive letter in the host position of the URI.
+    // I.e. "file://C:/Users/foo/bar.ext" =>
+    // "file:///C:/Users/foo/bar.ext"
+    if (wopiSrc.size() > 10)
+    {
+        if (isalpha((unsigned char)wopiSrc[7]) &&
+            wopiSrc[8] == ':')
+            wopiSrc = "file:///" +
+                std::string(1, wopiSrc[7]) +
+                ":" +
+                wopiSrc.substr(9);
+    }
+
+    std::shared_ptr<DocumentBroker> docBroker;
+    const std::string docKey = RequestDetails::getDocKey(wopiSrc);
+    {
+        std::lock_guard<std::mutex> lock(DocBrokersMutex);
+        const auto it = DocBrokers.find(docKey);
+        if (it != DocBrokers.end())
+            docBroker = it->second;
+    }
+    if (!docBroker)
+    {
+        LOG_ERR_S("No DocBroker for WOPISrc [" << wopiSrc << ']');
+        return E_FAIL;
+    }
+
+    // The same fields as ClientRequestDispatcher::handleMediaRequest(); most media has no "str".
+    const char* field = isVtt ? "str" : "url";
+    std::string mediaPath = docBroker->getEmbeddedMediaPath(tag, field);
+    if (mediaPath.empty())
+    {
+        LOG_DBG_S("No media path for tag [" << tag << "] field [" << field << ']');
+        return respondWithoutBody(env, args, 404, L"Not Found", L"");
+    }
+
+    // Yes, the same code snippet once again. FIXME: Should
+    // obviously factor this out into a utility function.
+    if (mediaPath.length() > 4 && mediaPath[0] == '/' &&
+        mediaPath[2] == ':' && mediaPath[3] == '/')
+        mediaPath = mediaPath.substr(1);
+
+    wil::com_ptr<IStream> fileStream;
+    hr = SHCreateStreamOnFileEx(Util::string_to_wide_string(mediaPath).c_str(),
+                                STGM_READ | STGM_SHARE_DENY_NONE, FILE_ATTRIBUTE_NORMAL, FALSE,
+                                nullptr, &fileStream);
+    if (!SUCCEEDED(hr))
+    {
+        LOG_ERR_S("Cannot open [" << mediaPath << "]: " << hr);
+        return respondWithoutBody(env, args, 404, L"Not Found", L"");
+    }
+
+    STATSTG fileStat{};
+    hr = fileStream->Stat(&fileStat, STATFLAG_NONAME);
+    if (!SUCCEEDED(hr))
+    {
+        LOG_ERR_S("Cannot stat [" << mediaPath << "]: " << hr);
+        return respondWithoutBody(env, args, 404, L"Not Found", L"");
+    }
+    const ULONGLONG size = fileStat.cbSize.QuadPart;
+
+    std::wstring headers = L"Content-Type: ";
+    headers += isVtt ? L"text/vtt" : L"application/octet-stream";
+    headers += L"\r\nAccess-Control-Allow-Origin: *\r\nAccept-Ranges: bytes\r\n"
+               L"Cache-Control: no-store\r\n";
+
+    int status = 200;
+    const wchar_t* reason = L"OK";
+    ULONGLONG first = 0;
+    ULONGLONG end = size;
+    wil::com_ptr<ICoreWebView2HttpRequestHeaders> requestHeaders;
+    BOOL hasRange = FALSE;
+    if (SUCCEEDED(request->get_Headers(&requestHeaders)) &&
+        SUCCEEDED(requestHeaders->Contains(L"Range", &hasRange)) && hasRange)
+    {
+        wil::unique_cotaskmem_string range;
+        if (SUCCEEDED(requestHeaders->GetHeader(L"Range", &range)))
+        {
+            const auto requested =
+                parseByteRange(Util::wide_string_to_string(range.get()), size);
+            if (!requested)
+            {
+                LOG_WRN_S("Unsatisfiable range [" << Util::wide_string_to_string(range.get())
+                                                   << "] for [" << mediaPath << "] of " << size
+                                                   << " bytes");
+                return respondWithoutBody(env, args, 416, L"Range Not Satisfiable",
+                                          L"Content-Range: bytes */" + std::to_wstring(size) +
+                                              L"\r\n");
+            }
+            std::tie(first, end) = *requested;
+            end = std::min<ULONGLONG>(end, first + kMediaResponseChunk);
+            status = 206;
+            reason = L"Partial Content";
+            LOG_DBG_S("Media request for bytes " << first << '-' << (end - 1) << " of " << size
+                                                 << " [" << mediaPath << ']');
+            headers += L"Content-Range: bytes " + std::to_wstring(first) + L'-' +
+                       std::to_wstring(end - 1) + L'/' + std::to_wstring(size) + L"\r\n";
+        }
+    }
+    headers += L"Content-Length: " + std::to_wstring(end - first) + L"\r\n";
+
+    wil::com_ptr<IStream> contentStream = fileStream;
+    if (status == 206)
+        contentStream = Microsoft::WRL::Make<MediaRangeStream>(fileStream, first, end - first).Get();
+
+    wil::com_ptr<ICoreWebView2WebResourceResponse> response;
+    hr = env->CreateWebResourceResponse(contentStream.get(), status, reason, headers.c_str(),
+                                        &response);
+    if (!SUCCEEDED(hr))
+    {
+        LOG_ERR_S("CreateWebResourceResponse() failed");
+        return hr;
+    }
+
+    hr = args->put_Response(response.get());
+    if (!SUCCEEDED(hr))
+    {
+        LOG_ERR_S("put_Response() failed");
+        return hr;
+    }
+    return S_OK;
+}
+
+// Register the ODF IFilter (odffilter.dll) with Windows Search and the
+// FullDetails / PreviewDetails property strings Explorer uses, both under
+// HKCU\Software\Classes. The two bindings the MSIX manifest cannot
+// express declaratively are:
+//
+//   - the per-extension IFilter chain Windows Search walks:
+//       .odt -> PersistentHandler ->
+//       PersistentAddinsRegistered\{IID_IFilter} -> IFilter CLSID
+//   - the per-extension FullDetails / PreviewDetails strings under
+//       SystemFileAssociations\.<ext>, which control the field list shown
+//       in Properties->Details and in the preview pane (the property
+//       handler itself is wired via desktop2:DesktopPropertyHandler in
+//       the manifest, but it only fills the fields Explorer asks for).
+//
+// HKCU\Software\Classes is silo'd for packaged processes - writes from
+// this process would land in a per-package virtual class hive that
+// Windows Search and Explorer never read. ProcMon confirmed this even
+// with unvirtualizedResources and with a self-respawned breakaway child:
+// the silo follows packaged-EXE images regardless. So instead we build a
+// .reg file and shell out to System32\reg.exe (unpackaged, escapes the
+// silo with the DesktopAppBreakaway attribute). reg.exe writes the
+// values to real HKCU where the shell looks for them.
+//
+// Idempotent on every launch.
+//
+// Limitation: HKCU writes survive package uninstall. Users who remove
+// Collabora Office may continue to see (silent) failed lookups for ODF
+// IFilter until the keys are pruned.
+static void registerOdfShellExtensions()
+{
+    // CLSIDs match engine/shell/source/win32/shlxthandler/odffilter/odffilter.hxx
+    static constexpr wchar_t kPersistentHandlerClsid[] =
+        L"{3EE9BB34-748E-4FBA-B6A5-94C200A11455}";
+    static constexpr wchar_t kIFilterClsid[] =
+        L"{DEB88601-6245-4803-81A5-13082BB738FF}";
+    // Microsoft's well-known IID_IFilter
+    static constexpr wchar_t kIidIFilter[] =
+        L"{89BCB740-6119-101A-BCB7-00DD010655AF}";
+
+    // Extensions we can actually filter - matches OOFileExtensionTable in
+    // engine/shell/source/win32/shlxthandler/util/fileextensions.cxx
+    static constexpr const wchar_t* kExtensions[] = {
+        L".odt", L".ott", L".odm", L".oth",
+        L".ods", L".ots",
+        L".odg", L".otg",
+        L".odp", L".otp",
+        L".odf", L".odb",
+        L".sxw", L".stw", L".sxg",
+        L".sxc", L".stc",
+        L".sxi", L".sti",
+        L".sxd", L".std",
+        L".sxm",
+        // Flat ODF (single XML file, no zip container).
+        L".fodt", L".fods", L".fodg", L".fodp",
+    };
+
+    static constexpr wchar_t kFullDetails[] =
+        L"prop:System.PropGroup.Description;"
+        L"System.Title;System.Author;System.Subject;"
+        L"System.Keywords;System.Comment;"
+        L"System.PropGroup.FileSystem;"
+        L"System.ItemNameDisplay;System.ItemTypeText;"
+        L"System.ItemFolderPathDisplay;System.Size;"
+        L"System.DateCreated;System.DateModified;System.FileAttributes";
+
+    static constexpr wchar_t kPreviewDetails[] =
+        L"prop:System.Title;*System.Author;*System.Subject;*System.Comment";
+
+    // Build the .reg file content.
+    std::wstring reg = L"Windows Registry Editor Version 5.00\r\n\r\n";
+    for (const wchar_t* ext : kExtensions)
+    {
+        reg += L"[HKEY_CURRENT_USER\\Software\\Classes\\";
+        reg += ext;
+        reg += L"\\PersistentHandler]\r\n@=\"";
+        reg += kPersistentHandlerClsid;
+        reg += L"\"\r\n\r\n";
+    }
+    reg += L"[HKEY_CURRENT_USER\\Software\\Classes\\CLSID\\";
+    reg += kPersistentHandlerClsid;
+    reg += L"]\r\n@=\"Collabora Office ODF IFilter Persistent Handler\"\r\n\r\n";
+    reg += L"[HKEY_CURRENT_USER\\Software\\Classes\\CLSID\\";
+    reg += kPersistentHandlerClsid;
+    reg += L"\\PersistentAddinsRegistered\\";
+    reg += kIidIFilter;
+    reg += L"]\r\n@=\"";
+    reg += kIFilterClsid;
+    reg += L"\"\r\n\r\n";
+    for (const wchar_t* ext : kExtensions)
+    {
+        reg += L"[HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\";
+        reg += ext;
+        reg += L"]\r\n\"FullDetails\"=\"";
+        reg += kFullDetails;
+        reg += L"\"\r\n\"PreviewDetails\"=\"";
+        reg += kPreviewDetails;
+        reg += L"\"\r\n\r\n";
+    }
+
+    // Write the .reg file under %LocalAppData%\<appName> with the UTF-16 LE
+    // BOM that reg.exe import expects.
+    PWSTR appDataFolder = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, NULL, &appDataFolder)))
+        return;
+    std::wstring regFilePath = appDataFolder;
+    CoTaskMemFree(appDataFolder);
+    regFilePath += L"\\";
+    regFilePath += appName;
+    CreateDirectoryW(regFilePath.c_str(), nullptr);
+    regFilePath += L"\\register-shellext.reg";
+
+    HANDLE hFile = CreateFileW(regFilePath.c_str(), GENERIC_WRITE, 0, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return;
+    const WORD bom = 0xFEFF;
+    DWORD written = 0;
+    WriteFile(hFile, &bom, sizeof(bom), &written, nullptr);
+    WriteFile(hFile, reg.data(),
+              static_cast<DWORD>(reg.size() * sizeof(wchar_t)),
+              &written, nullptr);
+    CloseHandle(hFile);
+
+    // Spawn System32\reg.exe import outside the silo via the
+    // DesktopAppBreakaway process attribute. The breakaway attribute does
+    // not let our own (packaged) EXE escape, but reg.exe is unpackaged so
+    // it goes to a plain desktop process whose writes hit real HKCU.
+    wchar_t systemDir[MAX_PATH];
+    if (GetSystemDirectoryW(systemDir, ARRAYSIZE(systemDir)) == 0)
+        return;
+    std::wstring cmdLine = L"\"";
+    cmdLine += systemDir;
+    cmdLine += L"\\reg.exe\" import \"";
+    cmdLine += regFilePath;
+    cmdLine += L"\"";
+
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
+    if (attrSize == 0)
+        return;
+    std::vector<BYTE> attrBuffer(attrSize);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrList =
+        reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attrBuffer.data());
+    if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize))
+        return;
+    DWORD policy = PROCESS_CREATION_DESKTOP_APP_BREAKAWAY_ENABLE_PROCESS_TREE;
+    if (!UpdateProcThreadAttribute(attrList, 0,
+                                   PROC_THREAD_ATTRIBUTE_DESKTOP_APP_POLICY,
+                                   &policy, sizeof(policy), NULL, NULL))
+    {
+        DeleteProcThreadAttributeList(attrList);
+        return;
+    }
+
+    // Capture reg.exe's stderr/stdout via a pipe so a failure message can
+    // be surfaced verbatim (e.g. "ERROR: Access is denied.") instead of
+    // just the numeric exit code.
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+    HANDLE hReadPipe = nullptr;
+    HANDLE hWritePipe = nullptr;
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 65536))
+    {
+        DeleteProcThreadAttributeList(attrList);
+        return;
+    }
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOEXW si = {};
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.StartupInfo.wShowWindow = SW_HIDE;
+    si.StartupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.StartupInfo.hStdOutput = hWritePipe;
+    si.StartupInfo.hStdError = hWritePipe;
+    si.lpAttributeList = attrList;
+
+    PROCESS_INFORMATION pi = {};
+    BOOL ok = CreateProcessW(NULL, cmdLine.data(), NULL, NULL, TRUE,
+                             EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+                             NULL, NULL,
+                             reinterpret_cast<LPSTARTUPINFOW>(&si), &pi);
+    DeleteProcThreadAttributeList(attrList);
+    // Parent must close its copy of the write end so the read end sees EOF
+    // when reg.exe exits.
+    CloseHandle(hWritePipe);
+    if (!ok)
+    {
+        CloseHandle(hReadPipe);
+        return;
+    }
+
+    WaitForSingleObject(pi.hProcess, 5000);
+
+    std::string output;
+    char buf[1024];
+    DWORD nRead = 0;
+    while (ReadFile(hReadPipe, buf, sizeof(buf), &nRead, nullptr) && nRead > 0)
+        output.append(buf, nRead);
+    CloseHandle(hReadPipe);
+
+    DWORD exitCode = STILL_ACTIVE;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    if (exitCode != 0)
+    {
+        while (!output.empty() && (output.back() == '\r' || output.back() == '\n'
+                                   || output.back() == ' ' || output.back() == '\t'))
+            output.pop_back();
+        // reg.exe writes in the user's OEM (console) codepage; widen for
+        // OutputDebugStringW. Log:: is not initialized yet at this point
+        // in wWinMain. DebugView (Sysinternals) captures the output.
+        int wlen = MultiByteToWideChar(CP_OEMCP, 0,
+                                       output.c_str(), static_cast<int>(output.size()),
+                                       nullptr, 0);
+        std::wstring wide(wlen, L'\0');
+        MultiByteToWideChar(CP_OEMCP, 0,
+                            output.c_str(), static_cast<int>(output.size()),
+                            wide.data(), wlen);
+        std::wstring msg = L"registerOdfShellExtensions: reg.exe failed: ";
+        msg += wide.empty() ? L"(no diagnostic on stderr)" : wide;
+        msg += L"\n";
+        OutputDebugStringW(msg.c_str());
+    }
+    DeleteFileW(regFilePath.c_str());
+}
+
+// The one WebView2 environment every web view in the app is created from, and
+// the callbacks that asked for it while it was still being made.
+static wil::com_ptr<ICoreWebView2Environment> webViewEnvironment;
+static std::vector<std::function<void(ICoreWebView2Environment*)>> webViewEnvironmentWaiters;
+static bool webViewEnvironmentUnderway = false;
+
+// Hand the shared environment to the callback, creating it on the first call.
+// Creation is asynchronous, so callers that arrive in the meantime wait and are
+// served in order once it is there.
+static void withWebView2Environment(std::function<void(ICoreWebView2Environment*)> callback)
+{
+    if (webViewEnvironment)
+    {
+        callback(webViewEnvironment.get());
+        return;
+    }
+
+    webViewEnvironmentWaiters.push_back(std::move(callback));
+
+    if (webViewEnvironmentUnderway)
+        return;
+    webViewEnvironmentUnderway = true;
+
+    // Configure the "cool" custom scheme registration
+    auto schemeRegistration =
+        Microsoft::WRL::Make<CoreWebView2CustomSchemeRegistration>(L"cool");
+    if (!SUCCEEDED(schemeRegistration->put_TreatAsSecure(TRUE)))
+        fatal("schemeRegistration->put_TreatAsSecure() failed");
+    if (!SUCCEEDED(schemeRegistration->put_HasAuthorityComponent(TRUE)))
+        fatal("schemeRegistration->put_HasAuthorityComponent() failed");
+
+    // We show a page from a file: URI, so we need to use "*"
+    LPCWSTR allowedOrigins[1] = { L"*" };
+    if (!SUCCEEDED(schemeRegistration->SetAllowedOrigins(1, allowedOrigins)))
+        fatal("schemeRegistration->SetAllowedOrigins() failed");
+
+    // Add the registration to the options (requires ICoreWebView2EnvironmentOptions4)
+    ICoreWebView2CustomSchemeRegistration* registrations[1] =
+        { schemeRegistration.Get() };
+
+    // Required for instantiating new Web Workers, which otherwise fail with a
+    // cross-origin SecurityError because file:// gets origin 'null'.
+    std::wstring additionalArgs = L"--allow-file-access-from-files";
+    if (!testRemoteDebuggingPort.empty())
+        additionalArgs += L" --remote-debugging-port=" + testRemoteDebuggingPort;
+
+    auto options = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
+    options->put_AdditionalBrowserArguments(additionalArgs.c_str());
+
+    Microsoft::WRL::ComPtr<ICoreWebView2EnvironmentOptions4> options4;
+    if (!SUCCEEDED(options.As(&options4)))
+        fatal("options.As() failed");
+    if (!SUCCEEDED(options4->SetCustomSchemeRegistrations(1, registrations)))
+        fatal("options4->SetCustomSchemeRegistrations() failed");
+
+    CreateCoreWebView2EnvironmentWithOptions(
+        nullptr,
+        (Util::string_to_wide_string(localAppData) + L"\\UDF").c_str(),
+        options.Get(),
+        Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+            [](HRESULT result, ICoreWebView2Environment* env) -> HRESULT
+            {
+                if (!env)
+                    fatal("CreateCoreWebView2EnvironmentWithOptions() gave us no environment");
+
+                webViewEnvironment = env;
+
+                const auto waiters = std::move(webViewEnvironmentWaiters);
+                webViewEnvironmentWaiters.clear();
+                for (const auto& waiter : waiters)
+                    waiter(env);
+
+                return S_OK;
+            })
+            .Get());
+}
+
+// The document kind the tab strip keys its icon and colour off. The engine
+// decides what a file really is when it opens it; the strip needs a name for it
+// before that, and the extension is what there is to go on.
+static std::string docTypeFromFilename(const std::string& filename)
+{
+    const auto lastPeriod = filename.find_last_of('.');
+    if (lastPeriod == std::string::npos)
+        return "other";
+
+    std::string extension = filename.substr(lastPeriod + 1);
+    for (char& c : extension)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    static const std::set<std::string> writer = { "odt", "doc", "docx", "docm", "rtf", "txt", "fodt" };
+    static const std::set<std::string> calc = { "ods", "xls", "xlsx", "xlsm", "csv", "fods" };
+    static const std::set<std::string> impress = { "odp", "ppt", "pptx", "pptm", "ppsx", "fodp" };
+    static const std::set<std::string> draw = { "odg", "fodg" };
+
+    if (writer.count(extension))
+        return "writer";
+    if (calc.count(extension))
+        return "calc";
+    if (impress.count(extension))
+        return "impress";
+    if (draw.count(extension))
+        return "draw";
+    return "other";
+}
+
+// The window takes its title from the document it shows.
+static std::wstring windowTitleForTab(const DocumentTab& tab)
+{
+    if (tab.filenameAndUri.filename.empty())
+        return Util::string_to_wide_string(APP_NAME);
+    return Util::string_to_wide_string(tab.filenameAndUri.filename + " - " APP_NAME);
+}
+
+// Give the window one more document, at the end of its tab order. The caller
+// connects it to the server and gives it a document id, which the backstage and
+// the presenter console, showing no document of their own, do without.
+static DocumentTab& createTab(WindowState& window, const FilenameAndUri& filenameAndUri,
+                              DocumentMode mode)
+{
+    static int nextTabId = 1;
+
+    const int tabId = nextTabId++;
+
+    DocumentTab& tab = documentTabs[tabId];
+    tab.tabId = tabId;
+    tab.hWnd = window.hWnd;
+    tab.filenameAndUri = filenameAndUri;
+    tab.mode = mode;
+    if (mode == DocumentMode::STARTER)
+        tab.docType = "starter";
+    else if (mode == DocumentMode::WELCOME)
+        tab.docType = "welcome";
+    else
+        tab.docType = docTypeFromFilename(filenameAndUri.filename);
+
+    window.tabIds.push_back(tabId);
+
+    return tab;
+}
+
+// How tall the tab strip is at the standard resolution, in the same units the
+// strip page lays itself out in.
+static const int TAB_STRIP_HEIGHT = 36;
+
+static int stripHeight(const WindowState& window)
+{
+    if (!window.stripIsVisible)
+        return 0;
+    return MulDiv(TAB_STRIP_HEIGHT, GetDpiForWindow(window.hWnd), USER_DEFAULT_SCREEN_DPI);
+}
+
+// A tabbed window shows its tab strip where the title bar would be. The client area covers the
+// title bar, and DWM extends its frame down over the strip, so the system still draws the minimize,
+// maximize and close buttons there. A window in full screen has no frame at all.
+static bool hasStripInTitleBar(const WindowState& window)
+{
+    return window.isTabbed &&
+           (GetWindowLongW(window.hWnd, GWL_STYLE) & WS_CAPTION) == WS_CAPTION;
+}
+
+// The height of the resize border along the top of a window. A window with the strip in its title
+// bar has that border inside its client area.
+static int topResizeBorderHeight(HWND hWnd)
+{
+    const UINT dpi = GetDpiForWindow(hWnd);
+    return GetSystemMetricsForDpi(SM_CYFRAME, dpi) +
+           GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+}
+
+// Where the strip starts from the top of the client area. A strip in the title bar leaves the top
+// resize border free. In a maximized window that border is above the screen, so the strip starts
+// at the top of the screen.
+static int stripTop(const WindowState& window)
+{
+    if (!hasStripInTitleBar(window))
+        return 0;
+    return topResizeBorderHeight(window.hWnd);
+}
+
+// The height of the frame that DWM extends into the client area, and that the caption buttons are
+// in, or 0 for a window that keeps its own title bar.
+static int titleBarFrameHeight(const WindowState& window)
+{
+    if (!hasStripInTitleBar(window))
+        return 0;
+    return stripTop(window) + MulDiv(TAB_STRIP_HEIGHT, GetDpiForWindow(window.hWnd),
+                                     USER_DEFAULT_SCREEN_DPI);
+}
+
+// Where the caption buttons start in client coordinates, or the end of the client area for a
+// window that keeps its own title bar. The buttons are at the end of the title bar, which is its
+// left end in a mirrored window, and the client coordinates of a mirrored window run from the
+// right. So in both cases the buttons are at the high end of the client coordinates.
+static LONG captionButtonsLeft(const WindowState& window)
+{
+    RECT client;
+    GetClientRect(window.hWnd, &client);
+
+    RECT buttons;
+    if (!hasStripInTitleBar(window) ||
+        FAILED(DwmGetWindowAttribute(window.hWnd, DWMWA_CAPTION_BUTTON_BOUNDS, &buttons,
+                                     sizeof(buttons))) ||
+        buttons.right <= buttons.left)
+        return client.right;
+
+    // The bounds are relative to the window, so the space between the buttons and the nearer edge
+    // of the window, less the border at the side of the client area, is what the client area has
+    // beyond the buttons.
+    RECT windowRect;
+    GetWindowRect(window.hWnd, &windowRect);
+    const LONG windowWidth = windowRect.right - windowRect.left;
+    const LONG border = (windowWidth - (client.right - client.left)) / 2;
+    const LONG beyond = std::max(0L, std::min(buttons.left, windowWidth - buttons.right) - border);
+    return std::clamp(client.right - beyond - (buttons.right - buttons.left), client.left,
+                      client.right);
+}
+
+// A minimized window has no client area at all, so both of these keep the
+// bottom edge at or below the top one: a web view rejects a rectangle that is
+// the wrong way round.
+static RECT stripBounds(const WindowState& window)
+{
+    RECT bounds;
+    GetClientRect(window.hWnd, &bounds);
+    bounds.top = std::min(bounds.bottom, bounds.top + stripTop(window));
+    bounds.bottom = std::min(bounds.bottom, bounds.top + stripHeight(window));
+    bounds.right = captionButtonsLeft(window);
+    return bounds;
+}
+
+static RECT documentArea(const WindowState& window)
+{
+    RECT bounds;
+    GetClientRect(window.hWnd, &bounds);
+    bounds.top = std::min(bounds.bottom, bounds.top + stripTop(window) + stripHeight(window));
+    return bounds;
+}
+
+// DWM draws its frame, with the caption buttons, in the top of the client area of a window with the
+// strip in its title bar.
+static void updateTitleBarFrame(const WindowState& window)
+{
+    MARGINS margins = { 0, 0, titleBarFrameHeight(window), 0 };
+    DwmExtendFrameIntoClientArea(window.hWnd, &margins);
+}
+
+// A point that the strip page gives in its own CSS pixels from the top left corner of the strip,
+// in screen coordinates. The page itself is never mirrored, so its left is the left of the screen
+// also in a mirrored window.
+static POINT stripPointToScreen(const WindowState& window, double x, double y)
+{
+    // With exactly two points, MapWindowPoints() keeps left less than right also when it maps out
+    // of a mirrored window.
+    RECT strip = stripBounds(window);
+    MapWindowPoints(window.hWnd, HWND_DESKTOP, reinterpret_cast<POINT*>(&strip), 2);
+
+    // The strip does not zoom, so the window's DPI is all that tells the two units apart.
+    const UINT dpi = GetDpiForWindow(window.hWnd);
+    return { strip.left + MulDiv(static_cast<int>(std::lround(x)), dpi, USER_DEFAULT_SCREEN_DPI),
+             strip.top + MulDiv(static_cast<int>(std::lround(y)), dpi, USER_DEFAULT_SCREEN_DPI) };
+}
+
+static void layoutTabs(WindowState& window)
+{
+    updateTitleBarFrame(window);
+
+    if (window.stripController)
+        window.stripController->put_Bounds(stripBounds(window));
+
+    // Every document keeps the right size, not just the one on show, so a
+    // switch between tabs never lands on a stale layout.
+    const RECT bounds = documentArea(window);
+    for (int tabId : window.tabIds)
+    {
+        DocumentTab* tab = findTab(tabId);
+        if (tab && tab->webViewController)
+            tab->webViewController->put_Bounds(bounds);
+    }
+}
+
+// Fresh strips start in the saved dark mode choice, or in the system theme.
+static std::string currentStripTheme()
+{
+    return darkModeEnabled() ? "dark" : "light";
+}
+
+// The state the tab strip draws, one entry per document in tab order.
+static std::string currentTabsJson(const WindowState& window)
+{
+    Poco::JSON::Array tabs;
+    for (int tabId : window.tabIds)
+    {
+        const DocumentTab* tab = findTab(tabId);
+        if (!tab)
+            continue;
+
+        Poco::JSON::Object::Ptr entry = new Poco::JSON::Object();
+        entry->set("id", tab->tabId);
+        entry->set("title", tab->filenameAndUri.filename);
+        // The full path of the document file. The starter backstage and the welcome slideshow
+        // have none.
+        if (tab->mode != DocumentMode::STARTER && tab->mode != DocumentMode::WELCOME)
+            entry->set("path", fileUriToWindowsPath(tab->filenameAndUri.uri));
+        entry->set("docType", tab->docType);
+        entry->set("modified", tab->isModified);
+        entry->set("active", tab->tabId == window.activeTabId);
+        entry->set("hasThumbnail", !tab->thumbnailPng.empty());
+        tabs.add(entry);
+    }
+
+    std::ostringstream oss;
+    tabs.stringify(oss);
+    return oss.str();
+}
+
+// The strip page reads a notification as {signal, args}, the mirror image of the
+// {call, args} it posts back.
+static void notifyStrip(WindowState& window, const std::string& signal,
+                        const std::string& argument)
+{
+    if (!window.stripWebView)
+        return;
+
+    Poco::JSON::Array::Ptr args = new Poco::JSON::Array();
+    args->add(argument);
+
+    Poco::JSON::Object::Ptr envelope = new Poco::JSON::Object();
+    envelope->set("signal", signal);
+    envelope->set("args", args);
+
+    std::ostringstream oss;
+    envelope->stringify(oss);
+
+    window.stripWebView->PostWebMessageAsJson(
+        Util::string_to_wide_string(oss.str()).c_str());
+}
+
+static void updateStripVisibility(WindowState& window)
+{
+    // The strip is to take the place of the title bar, so a tabbed window shows it also with a
+    // single document. A presentation wants the whole monitor.
+    const bool visible = window.isTabbed && !window.tabIds.empty() && !window.isFullScreen;
+    if (visible == window.stripIsVisible)
+        return;
+
+    window.stripIsVisible = visible;
+    if (!visible)
+        hideHoverCard();
+    if (window.stripController)
+        window.stripController->put_IsVisible(visible && window.stripHasContent);
+    layoutTabs(window);
+}
+
+static void pushTabsToStrip(WindowState& window)
+{
+    updateStripVisibility(window);
+    notifyStrip(window, "tabsChanged", currentTabsJson(window));
+}
+
+// The strip page handles no keys, so the keyboard belongs to the document even
+// when the click that got us here landed on a tab.
+static void focusActiveDocument(const WindowState& window)
+{
+    DocumentTab* tab = activeTabOf(window);
+    if (tab && tab->webViewController && tab->hasContent)
+        tab->webViewController->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+}
+
+// How long the pointer has to rest on a tab before its hover card shows, in milliseconds.
+static const UINT HOVER_CARD_DELAY = 500;
+// The timer of the hover card window that holds that delay.
+static const int TIMER_ID_HOVER_CARD = 1;
+// The sizes in the hover card, at the standard resolution. The frame of the image has the shape of
+// a 16:9 slide, and the corners of the image have the radius of --border-radius.
+static const int HOVER_CARD_IMAGE_WIDTH = 240;
+static const int HOVER_CARD_IMAGE_HEIGHT = 135;
+static const int HOVER_CARD_IMAGE_RADIUS = 4;
+// The border of the card, and the space inside it around the title and the image and between the
+// two.
+static const int HOVER_CARD_BORDER = 1;
+static const int HOVER_CARD_PADDING = 8;
+// The title is one line of 12px text, as --default-font-size, with a line height of 16px. It starts
+// a little in from the edge of the image.
+static const int HOVER_CARD_TITLE_FONT_SIZE = 12;
+static const int HOVER_CARD_TITLE_HEIGHT = 16;
+static const int HOVER_CARD_TITLE_INDENT = 2;
+// The space between the foot of the tab and the top of the card.
+static const int HOVER_CARD_GAP = 4;
+
+// The card with the name and the image of a background document, below the tab that the pointer
+// rests on. One card serves every window, because the pointer rests on one tab at a time.
+struct HoverCard
+{
+    HWND hWnd = 0;
+    // The system rounds the corners of the card and draws its border, which Windows 11 does and
+    // Windows 10 does not.
+    bool systemDrawsBorder = false;
+    // The tab the card is for, or 0 when the pointer rests on no tab.
+    int tabId = 0;
+    // The bottom corner of that tab where the tab starts, in screen coordinates.
+    POINT position = {};
+    // The tabs run from right to left, so the card lines up with the right edge of its tab.
+    bool rightToLeft = false;
+    // The colours of the card, from the theme of the strip. The image background shows around an
+    // image of another shape than its frame.
+    COLORREF background = RGB(0xf8, 0xf9, 0xfa);
+    COLORREF text = RGB(0x33, 0x33, 0x33);
+    COLORREF border = RGB(0x94, 0x94, 0x94);
+    COLORREF imageBackground = RGB(0xe8, 0xe8, 0xe8);
+    // What the card shows, drawn whole, and painted as it is.
+    HBITMAP picture = nullptr;
+};
+
+static HoverCard hoverCard;
+
+// A colour from the strip page, which gives it as a CSS colour string such as "#f8f9fa" or
+// "rgb(248, 249, 250)". Any other form gives the fallback.
+static COLORREF cssColor(const std::string& css, COLORREF fallback)
+{
+    const std::size_t first = css.find_first_not_of(" \t");
+    if (first == std::string::npos)
+        return fallback;
+    const std::string value = css.substr(first, css.find_last_not_of(" \t") - first + 1);
+
+    if (value[0] == '#')
+    {
+        const std::string hex = value.substr(1);
+        if (hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+            return fallback;
+        // The short forms have one digit for each channel, and an alpha channel is ignored.
+        if (hex.size() == 3 || hex.size() == 4)
+            return RGB(std::stoi(hex.substr(0, 1), nullptr, 16) * 17,
+                       std::stoi(hex.substr(1, 1), nullptr, 16) * 17,
+                       std::stoi(hex.substr(2, 1), nullptr, 16) * 17);
+        if (hex.size() == 6 || hex.size() == 8)
+            return RGB(std::stoi(hex.substr(0, 2), nullptr, 16),
+                       std::stoi(hex.substr(2, 2), nullptr, 16),
+                       std::stoi(hex.substr(4, 2), nullptr, 16));
+        return fallback;
+    }
+
+    if (value.starts_with("rgb(") || value.starts_with("rgba("))
+    {
+        const char* p = value.c_str() + value.find('(') + 1;
+        int channels[3];
+        for (int& channel : channels)
+        {
+            char* end;
+            const long number = std::strtol(p, &end, 10);
+            if (end == p || number < 0 || number > 255)
+                return fallback;
+            channel = static_cast<int>(number);
+            p = end + std::strspn(end, " ,");
+        }
+        return RGB(channels[0], channels[1], channels[2]);
+    }
+
+    return fallback;
+}
+
+
+// A PNG image fitted inside a box of the given size in pixels, keeping its shape, as rows of
+// pixels from the top down, in BGRA with the colour multiplied by the alpha. The size of the image
+// goes to size. There are no pixels when the PNG cannot be read.
+static std::vector<uint32_t> fittedImage(const std::string& png, int boxWidth, int boxHeight,
+                                         SIZE& size)
+{
+    wil::com_ptr<IWICImagingFactory> factory;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_PPV_ARGS(factory.put()))))
+        return {};
+
+    wil::com_ptr<IWICStream> stream;
+    if (FAILED(factory->CreateStream(&stream)) ||
+        FAILED(stream->InitializeFromMemory(
+            reinterpret_cast<BYTE*>(const_cast<char*>(png.data())),
+            static_cast<DWORD>(png.size()))))
+        return {};
+
+    wil::com_ptr<IWICBitmapDecoder> decoder;
+    wil::com_ptr<IWICBitmapFrameDecode> frame;
+    UINT width, height;
+    if (FAILED(factory->CreateDecoderFromStream(stream.get(), nullptr,
+                                                WICDecodeMetadataCacheOnDemand, &decoder)) ||
+        FAILED(decoder->GetFrame(0, &frame)) || FAILED(frame->GetSize(&width, &height)) ||
+        width == 0 || height == 0)
+        return {};
+
+    const double scale = std::min(static_cast<double>(boxWidth) / width,
+                                  static_cast<double>(boxHeight) / height);
+    const UINT fittedWidth = std::max(1U, static_cast<UINT>(std::lround(width * scale)));
+    const UINT fittedHeight = std::max(1U, static_cast<UINT>(std::lround(height * scale)));
+
+    wil::com_ptr<IWICBitmapScaler> scaler;
+    wil::com_ptr<IWICFormatConverter> converter;
+    if (FAILED(factory->CreateBitmapScaler(&scaler)) ||
+        FAILED(scaler->Initialize(frame.get(), fittedWidth, fittedHeight,
+                                  WICBitmapInterpolationModeFant)) ||
+        FAILED(factory->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(scaler.get(), GUID_WICPixelFormat32bppPBGRA,
+                                     WICBitmapDitherTypeNone, nullptr, 0.0,
+                                     WICBitmapPaletteTypeCustom)))
+        return {};
+
+    std::vector<uint32_t> pixels(static_cast<std::size_t>(fittedWidth) * fittedHeight);
+    const UINT stride = fittedWidth * 4;
+    if (FAILED(converter->CopyPixels(nullptr, stride, stride * fittedHeight,
+                                     reinterpret_cast<BYTE*>(pixels.data()))))
+        return {};
+
+    size = { static_cast<LONG>(fittedWidth), static_cast<LONG>(fittedHeight) };
+    return pixels;
+}
+
+// How much of the pixel at x, y a rectangle of the given size at the origin, with rounded corners
+// of the given radius, covers, from 0 to 1. The edge is smoothed over one pixel.
+static float roundedRectCoverage(int x, int y, float width, float height, float radius)
+{
+    const float qx = std::abs(x + 0.5f - width / 2) - (width / 2 - radius);
+    const float qy = std::abs(y + 0.5f - height / 2) - (height / 2 - radius);
+    const float distance = std::hypot(std::max(qx, 0.0f), std::max(qy, 0.0f)) +
+                           std::min(std::max(qx, qy), 0.0f) - radius;
+    return std::clamp(0.5f - distance, 0.0f, 1.0f);
+}
+
+
+static void hideHoverCard()
+{
+    hoverCard.tabId = 0;
+    if (hoverCard.hWnd)
+    {
+        KillTimer(hoverCard.hWnd, TIMER_ID_HOVER_CARD);
+        ShowWindow(hoverCard.hWnd, SW_HIDE);
+    }
+}
+
+// A bitmap that the pixels can be written to directly, rows from the top down.
+static HBITMAP createPixelBitmap(int width, int height, uint32_t*& pixels)
+{
+    BITMAPINFO info = {};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    pixels = static_cast<uint32_t*>(bits);
+    return bitmap;
+}
+
+// Show the card for the tab that the pointer rests on, with the image that its document sent
+// last. The active tab shows the document itself, so it gets no card.
+static void showHoverCard()
+{
+    DocumentTab* tab = findTab(hoverCard.tabId);
+    WindowState* window = tab ? findWindow(tab->hWnd) : nullptr;
+    if (!hoverCard.hWnd || !window || tab->thumbnailPng.empty() ||
+        window->activeTabId == tab->tabId)
+    {
+        if (hoverCard.hWnd)
+            ShowWindow(hoverCard.hWnd, SW_HIDE);
+        return;
+    }
+
+    const UINT dpi = GetDpiForWindow(window->hWnd);
+    const auto scaled = [dpi](int value) { return MulDiv(value, dpi, USER_DEFAULT_SCREEN_DPI); };
+
+    const int border = std::max(1, scaled(HOVER_CARD_BORDER));
+    const int padding = scaled(HOVER_CARD_PADDING);
+    const int imageWidth = scaled(HOVER_CARD_IMAGE_WIDTH);
+    const int imageHeight = scaled(HOVER_CARD_IMAGE_HEIGHT);
+    const int titleHeight = scaled(HOVER_CARD_TITLE_HEIGHT);
+    const int cardWidth = 2 * (border + padding) + imageWidth;
+    const int cardHeight = 2 * (border + padding) + titleHeight + padding + imageHeight;
+    const int imageLeft = border + padding;
+    const int imageTop = border + padding + titleHeight + padding;
+
+    // The tooltip of a tab shows the full path of its document, so the card does too.
+    const std::string path = fileUriToWindowsPath(tab->filenameAndUri.uri);
+    const std::wstring title =
+        Util::string_to_wide_string(path.empty() ? tab->filenameAndUri.filename : path);
+    std::wstring accessibleName = translate("TabManager", "Preview of %1");
+    const std::size_t placeholder = accessibleName.find(L"%1");
+    if (placeholder != std::wstring::npos)
+        accessibleName.replace(placeholder, 2, title);
+    SetWindowTextW(hoverCard.hWnd, accessibleName.c_str());
+
+    uint32_t* card = nullptr;
+    HBITMAP picture = createPixelBitmap(cardWidth, cardHeight, card);
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!picture || !dc)
+    {
+        if (picture)
+            DeleteObject(picture);
+        if (dc)
+            DeleteDC(dc);
+        return;
+    }
+
+    // The background, the border where the system draws none, and the title, which starts a
+    // little in from the edge of the image.
+    const HGDIOBJ oldBitmap = SelectObject(dc, picture);
+    const RECT cardRect = { 0, 0, cardWidth, cardHeight };
+    HBRUSH backgroundBrush = CreateSolidBrush(hoverCard.background);
+    FillRect(dc, &cardRect, backgroundBrush);
+    DeleteObject(backgroundBrush);
+    if (!hoverCard.systemDrawsBorder)
+    {
+        HBRUSH borderBrush = CreateSolidBrush(hoverCard.border);
+        FrameRect(dc, &cardRect, borderBrush);
+        DeleteObject(borderBrush);
+    }
+
+    NONCLIENTMETRICSW metrics = { sizeof(NONCLIENTMETRICSW) };
+    LOGFONTW logFont = {};
+    if (SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi))
+        logFont = metrics.lfMessageFont;
+    logFont.lfHeight = -scaled(HOVER_CARD_TITLE_FONT_SIZE);
+    logFont.lfWidth = 0;
+    HFONT font = CreateFontIndirectW(&logFont);
+    const HGDIOBJ oldFont =
+        SelectObject(dc, font ? static_cast<HGDIOBJ>(font) : GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, hoverCard.text);
+    RECT titleRect = { imageLeft + scaled(HOVER_CARD_TITLE_INDENT), border + padding,
+                       imageLeft + imageWidth, border + padding + titleHeight };
+    DrawTextW(dc, title.c_str(), -1, &titleRect,
+              DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_PATH_ELLIPSIS);
+    GdiFlush();
+    SelectObject(dc, oldFont);
+    if (font)
+        DeleteObject(font);
+    SelectObject(dc, oldBitmap);
+    DeleteDC(dc);
+
+    // The image, fitted inside its frame and centred on the image background. The frame has
+    // rounded corners, so at its corners the background of the card shows. The pixels of the
+    // image have the colour multiplied by the alpha.
+    SIZE fittedSize = {};
+    const std::vector<uint32_t> image =
+        fittedImage(tab->thumbnailPng, imageWidth, imageHeight, fittedSize);
+    const int fittedLeft = (imageWidth - fittedSize.cx) / 2;
+    const int fittedTop = (imageHeight - fittedSize.cy) / 2;
+    const float imageRadius = static_cast<float>(scaled(HOVER_CARD_IMAGE_RADIUS));
+    const auto channel = [](uint32_t pixel, int shift) { return (pixel >> shift) & 0xff; };
+    const auto colorChannel = [](COLORREF color, int shift)
+    {
+        // A COLORREF holds red, green and blue from the low byte up, and a bitmap pixel holds
+        // them from the high byte down.
+        return shift == 0 ? GetBValue(color) : shift == 8 ? GetGValue(color) : GetRValue(color);
+    };
+    for (int y = 0; y < imageHeight; y++)
+    {
+        for (int x = 0; x < imageWidth; x++)
+        {
+            const int fittedX = x - fittedLeft;
+            const int fittedY = y - fittedTop;
+            const bool inImage = fittedX >= 0 && fittedX < fittedSize.cx && fittedY >= 0 &&
+                                 fittedY < fittedSize.cy;
+            const uint32_t imagePixel = inImage ? image[fittedY * fittedSize.cx + fittedX] : 0;
+            const float coverage = roundedRectCoverage(x, y, static_cast<float>(imageWidth),
+                                                       static_cast<float>(imageHeight),
+                                                       imageRadius);
+
+            uint32_t& pixel = card[(imageTop + y) * cardWidth + imageLeft + x];
+            uint32_t result = 0;
+            for (int shift = 0; shift <= 16; shift += 8)
+            {
+                const float uncovered = 1 - channel(imagePixel, 24) / 255.0f;
+                const float framed = channel(imagePixel, shift) +
+                                     colorChannel(hoverCard.imageBackground, shift) * uncovered;
+                const float value = framed * coverage + channel(pixel, shift) * (1 - coverage);
+                result |= static_cast<uint32_t>(std::lround(std::clamp(value, 0.0f, 255.0f)))
+                          << shift;
+            }
+            pixel = result;
+        }
+    }
+
+    if (hoverCard.picture)
+        DeleteObject(hoverCard.picture);
+    hoverCard.picture = picture;
+
+    if (hoverCard.systemDrawsBorder)
+        DwmSetWindowAttribute(hoverCard.hWnd, DWMWA_BORDER_COLOR, &hoverCard.border,
+                              sizeof(hoverCard.border));
+
+    // The card stands a little below the tab, and lines up with the edge of the tab where the tab
+    // starts. It stays on the monitor of the tab, even for a tab near its edge.
+    POINT position = { hoverCard.rightToLeft ? hoverCard.position.x - cardWidth
+                                             : hoverCard.position.x,
+                       hoverCard.position.y + scaled(HOVER_CARD_GAP) };
+    MONITORINFO monitor = { sizeof(MONITORINFO) };
+    if (GetMonitorInfoW(MonitorFromPoint(hoverCard.position, MONITOR_DEFAULTTONEAREST), &monitor))
+        position.x = std::max(monitor.rcWork.left,
+                              std::min(position.x, monitor.rcWork.right - cardWidth));
+
+    SetWindowPos(hoverCard.hWnd, HWND_TOPMOST, position.x, position.y, cardWidth, cardHeight,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(hoverCard.hWnd, nullptr, FALSE);
+}
+
+// The pointer has come to rest on a tab of the window. The point is the bottom corner of the tab
+// where the tab starts, in the CSS pixels of the strip, which is its right corner when the tabs run
+// from right to left. The colours are those of the theme of the strip.
+static void startHoverCard(const WindowState& window, int tabId, POINT point,
+                           const std::string& background, const std::string& text,
+                           const std::string& border, bool rightToLeft,
+                           const std::string& imageBackground)
+{
+    if (!hoverCard.hWnd)
+    {
+        hoverCard.hWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                                         hoverCardWindowClass, L"", WS_POPUP, 0, 0, 0, 0,
+                                         nullptr, nullptr, appInstance, nullptr);
+        if (!hoverCard.hWnd)
+            return;
+
+        // Windows 11 rounds the corners of the card, as those of a tooltip, and draws its border.
+        // Windows 10 does not know the attribute and keeps the card square.
+        const DWORD roundSmall = DWMWCP_ROUNDSMALL;
+        hoverCard.systemDrawsBorder =
+            SUCCEEDED(DwmSetWindowAttribute(hoverCard.hWnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                                            &roundSmall, sizeof(roundSmall)));
+    }
+
+    hoverCard.tabId = tabId;
+    hoverCard.position = stripPointToScreen(window, point.x, point.y);
+    hoverCard.rightToLeft = rightToLeft;
+    hoverCard.background = cssColor(background, RGB(0xf8, 0xf9, 0xfa));
+    hoverCard.text = cssColor(text, RGB(0x33, 0x33, 0x33));
+    hoverCard.border = cssColor(border, RGB(0x94, 0x94, 0x94));
+    hoverCard.imageBackground = cssColor(imageBackground, RGB(0xe8, 0xe8, 0xe8));
+
+    // Moving from one tab to the next while a card is up swaps the card at once.
+    if (IsWindowVisible(hoverCard.hWnd))
+        showHoverCard();
+    else
+        SetTimer(hoverCard.hWnd, TIMER_ID_HOVER_CARD, HOVER_CARD_DELAY, nullptr);
+}
+
+// The card only shows what the pointer rests on, so it takes neither the focus nor the mouse.
+static LRESULT CALLBACK HoverCardWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+        case WM_TIMER:
+            if (wParam != TIMER_ID_HOVER_CARD)
+                break;
+            KillTimer(hWnd, TIMER_ID_HOVER_CARD);
+            showHoverCard();
+            return 0;
+
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+
+        case WM_NCHITTEST:
+            return HTTRANSPARENT;
+
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_PAINT:
+        {
+            PAINTSTRUCT paint;
+            HDC dc = BeginPaint(hWnd, &paint);
+            if (hoverCard.picture)
+            {
+                if (HDC pictureDC = CreateCompatibleDC(dc))
+                {
+                    BITMAP size;
+                    GetObjectW(hoverCard.picture, sizeof(size), &size);
+                    const HGDIOBJ oldBitmap = SelectObject(pictureDC, hoverCard.picture);
+                    BitBlt(dc, 0, 0, size.bmWidth, size.bmHeight, pictureDC, 0, 0, SRCCOPY);
+                    SelectObject(pictureDC, oldBitmap);
+                    DeleteDC(pictureDC);
+                }
+            }
+            EndPaint(hWnd, &paint);
+            return 0;
+        }
+    }
+
+    return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
+static void createDocumentView(int tabId);
+
+// How long the live-view limit waits before it runs, in milliseconds. A tab switch is one of a run
+// of them as often as not, and the tab the user stops on is the one that matters.
+static const UINT LIVE_VIEW_LIMIT_DELAY = 1000;
+// How long a tab has to stay the one on show before it gets a WebView2 again, in milliseconds.
+static const UINT VIEW_RESTORE_DELAY = 250;
+
+// Counts tab activations. Each tab records the value it saw when it was last activated.
+static unsigned long long activationTick = 0;
+
+// Whether the live-view limit may take the WebView2 of this tab away. The tab has to show a
+// document from a file, and the page has to have a session that the document can do without.
+static bool mayDiscardView(const DocumentTab& tab)
+{
+    // The starter backstage, the welcome slideshow and a presenter console hold no document of
+    // their own. A page that has not said hello has no session yet, and a tab that is closing goes
+    // anyway.
+    if (tab.viewDiscarded || tab.isConsole || tab.readyToClose || !tab.app2js.joinable())
+        return false;
+    if (tab.mode != DocumentMode::EDIT && tab.mode != DocumentMode::NEW)
+        return false;
+    if (!tab.filenameAndUri.uri.starts_with("file:"))
+        return false;
+
+    // A running presentation ends with the view it was started from.
+    const WindowState* window = findWindow(tab.hWnd);
+    if (!window || window->isPresFullScreen || tab.hConsoleWnd)
+        return false;
+
+    return true;
+}
+
+// Milliseconds this tab still has to keep its WebView2 before the live-view limit may take it, or
+// 0 when it has had its time.
+static int millisecondsUntilViewSettled(const DocumentTab& tab)
+{
+    // A view is kept for a few seconds after it is built, so that switching quickly between more
+    // tabs than the limit allows leaves the views it just built alone. The page needs about a
+    // second of that to load and rejoin its document.
+    constexpr ULONGLONG settleMilliseconds = 5000;
+    const ULONGLONG age = GetTickCount64() - tab.viewLiveSince;
+    if (age < settleMilliseconds)
+        return static_cast<int>(settleMilliseconds - age);
+
+    // The server stops a document whose last session goes before it has loaded.
+    const std::shared_ptr<DocumentBroker> broker = findBrokerByMobileAppDocId(tab.appDocId);
+    return broker && broker->isLoaded() ? 0 : 1000;
+}
+
+// Take the WebView2 of a tab away, and with it the renderer process of its page. The document stays
+// loaded in the engine, with no session, until the tab gets a new WebView2.
+static void discardTabView(DocumentTab& tab)
+{
+    // The broker is marked before the socket goes, so it never sees an empty session list that it
+    // would take for the end of the document.
+    const std::shared_ptr<DocumentBroker> broker = findBrokerByMobileAppDocId(tab.appDocId);
+    if (!broker)
+        return;
+
+    LOG_INF("Discarding the view of appDocId " << tab.appDocId << ", client fd "
+                                               << tab.fakeClientFd);
+    broker->setDetached(true);
+
+    // The goodbye wakes the forwarding thread, which closes the client socket, and with it the
+    // session of this view, and then ends.
+    do_bye_handling_things(tab);
+    tab.app2js.join();
+    tab.fakeClientFd = -1;
+
+    if (tab.webViewController)
+    {
+        tab.webViewController->Close();
+        tab.webViewController = nullptr;
+    }
+    tab.webView = nullptr;
+    tab.hasContent = false;
+    tab.viewDiscarded = true;
+}
+
+// Give a tab whose WebView2 was taken away a new one.
+static void restoreTabView(DocumentTab& tab)
+{
+    if (!tab.viewDiscarded)
+        return;
+
+    LOG_INF("Restoring the view of appDocId " << tab.appDocId);
+
+    // The page connects this socket when it says hello, and the first message carries the appDocId
+    // of the document that is still loaded, so the page rejoins it rather than loading the file
+    // again.
+    tab.fakeClientFd = fakeSocketSocket();
+    tab.viewDiscarded = false;
+    createDocumentView(tab.tabId);
+}
+
+static void scheduleLiveViewLimit(WindowState& window, UINT delayMilliseconds);
+
+// Ask the page of a tab beyond the live-view limit to save its document, so that the tab can lose
+// its WebView2 without losing a change. One drop asks for one save, so a document whose save fails
+// keeps its WebView2.
+static void requestSaveThenDiscard(DocumentTab& tab)
+{
+    if (tab.dropWaitsForSave || tab.dropSaveAsked || !tab.webView)
+        return;
+
+    LOG_TRC("Tab " << tab.tabId << " saves before its WebView2 goes");
+    tab.dropWaitsForSave = true;
+    tab.dropSaveAsked = true;
+
+    // The page answers with SAVECOMPLETED or SAVEFAILED when the save finishes, or with
+    // SAVECOMPLETED at once when there is nothing to save. The save is a quiet one, so a failure
+    // shows no prompt, and the user stays on the tab they are on. A page that cannot run the
+    // script answers nothing.
+    const int tabId = tab.tabId;
+    tab.webView->ExecuteScript(
+        L"if (window.app && window.app.map)"
+        L"  window.app.map._saveQuietlyForNativeHost();"
+        L"else window.postMobileMessage('SAVECOMPLETED');",
+        Microsoft::WRL::Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+            [tabId](HRESULT errorCode, LPCWSTR) -> HRESULT
+            {
+                if (FAILED(errorCode))
+                {
+                    if (DocumentTab* saving = findTab(tabId))
+                        saving->dropWaitsForSave = false;
+                }
+                return S_OK;
+            })
+            .Get());
+}
+
+// Run the live-view limit of a tabbed window after a delay, so that a run of tab switches settles
+// first.
+static void scheduleLiveViewLimit(WindowState& window, UINT delayMilliseconds)
+{
+    if (!window.isTabbed || CODAConfig::instance().liveViewLimit() <= 0)
+        return;
+
+    // A run that is already due sooner covers this one too.
+    const ULONGLONG due = GetTickCount64() + delayMilliseconds;
+    if (window.liveViewLimitDue != 0 && window.liveViewLimitDue <= due)
+        return;
+
+    window.liveViewLimitDue = due;
+    SetTimer(window.hWnd, TIMER_ID_LIVE_VIEW_LIMIT, delayMilliseconds, nullptr);
+}
+
+// Take the WebView2 away from every tab of the window beyond the live-view limit, least recently
+// used first, so the number of renderer processes stays bounded as documents are opened. The limit
+// counts the tabs of this window only, as in CODA-Q, so each window keeps up to the limit live.
+static void enforceLiveViewLimit(WindowState& window)
+{
+    window.liveViewLimitDue = 0;
+
+    const int limit = CODAConfig::instance().liveViewLimit();
+    if (limit <= 0)
+        return;
+
+    // Most recently used first. The tab on show is always the most recent one.
+    std::vector<DocumentTab*> byUse;
+    byUse.reserve(window.tabIds.size());
+    for (int tabId : window.tabIds)
+    {
+        if (DocumentTab* tab = findTab(tabId))
+            byUse.push_back(tab);
+    }
+    std::sort(byUse.begin(), byUse.end(), [](const DocumentTab* a, const DocumentTab* b)
+              { return a->lastActiveTick > b->lastActiveTick; });
+
+    int live = 0;
+    int retryInMilliseconds = -1;
+    for (DocumentTab* tab : byUse)
+    {
+        if (tab->viewDiscarded)
+            continue;
+        ++live;
+        if (live <= limit || tab->tabId == window.activeTabId || !mayDiscardView(*tab))
+            continue;
+
+        const int settleMilliseconds = millisecondsUntilViewSettled(*tab);
+        if (settleMilliseconds > 0)
+        {
+            if (retryInMilliseconds < 0 || settleMilliseconds < retryInMilliseconds)
+                retryInMilliseconds = settleMilliseconds;
+            continue;
+        }
+
+        // Only a document whose content is already in its file loses its view, so the drop costs
+        // no content at all.
+        if (tab->isModified || tab->dropWaitsForSave)
+        {
+            requestSaveThenDiscard(*tab);
+            continue;
+        }
+
+        discardTabView(*tab);
+        if (tab->viewDiscarded)
+            --live;
+    }
+
+    // A view that only has to grow older is worth asking about again once it has.
+    if (retryInMilliseconds > 0)
+        scheduleLiveViewLimit(window, static_cast<UINT>(retryInMilliseconds));
+}
+
+// Give the tab on show its WebView2 again, once the user has stayed on it.
+static void restoreActiveTabView(WindowState& window)
+{
+    DocumentTab* tab = activeTabOf(window);
+    if (!tab || !tab->viewDiscarded)
+        return;
+
+    restoreTabView(*tab);
+    scheduleLiveViewLimit(window, LIVE_VIEW_LIMIT_DELAY);
+}
+
+// Bring one document of the window to the front and leave the rest behind it.
+static void activateTab(WindowState& window, int tabId)
+{
+    DocumentTab* tab = findTab(tabId);
+    if (!tab)
+        return;
+
+    hideHoverCard();
+
+    // The tab the user leaves sends an image of what it shows, for the card of its tab.
+    DocumentTab* previous = activeTabOf(window);
+    if (previous && previous != tab && previous->webView && previous->hasContent)
+        previous->webView->ExecuteScript(
+            L"if (window.app && window.app.map && window.app.map.requestTabThumbnail)"
+            L"  window.app.map.requestTabThumbnail();",
+            Microsoft::WRL::Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+                [](HRESULT, LPCWSTR) -> HRESULT { return S_OK; })
+                .Get());
+
+    window.activeTabId = tabId;
+    tab->lastActiveTick = ++activationTick;
+    // A save that the live-view limit asked for still finishes. The next time the user leaves
+    // this tab, the limit may ask for another one.
+    tab->dropSaveAsked = false;
+    tab->dropWaitsForSave = false;
+
+    // A tab the user passes through gets no WebView2 until they stay on it.
+    if (tab->viewDiscarded)
+        SetTimer(window.hWnd, TIMER_ID_VIEW_RESTORE, VIEW_RESTORE_DELAY, nullptr);
+    else
+        KillTimer(window.hWnd, TIMER_ID_VIEW_RESTORE);
+
+    for (int otherId : window.tabIds)
+    {
+        DocumentTab* other = findTab(otherId);
+        if (other && other->webViewController)
+            other->webViewController->put_IsVisible(otherId == tabId && other->hasContent);
+    }
+
+    focusActiveDocument(window);
+
+    SetWindowTextW(window.hWnd, windowTitleForTab(*tab).c_str());
+
+    pushTabsToStrip(window);
+
+    scheduleLiveViewLimit(window, LIVE_VIEW_LIMIT_DELAY);
+}
+
+static void removeTabFromWindow(WindowState& window, int tabId);
+
+static void closeTab(WindowState& window, int tabId)
+{
+    DocumentTab* tab = findTab(tabId);
+    if (!tab)
+        return;
+
+    if (hoverCard.tabId == tabId)
+        hideHoverCard();
+
+    if (tab->isConsole)
+    {
+        // The presentation ends with its console: the document comes out of
+        // full screen and forgets the window it was driving.
+        DocumentTab* presenting = findTab(tab->presentingTabId);
+        if (presenting)
+        {
+            WindowState* presentingWindow = findWindow(presenting->hWnd);
+            if (presentingWindow)
+                leave_full_screen(*presentingWindow);
+            presenting->hConsoleWnd = 0;
+        }
+    }
+    else if (tab->mode != DocumentMode::STARTER && tab->mode != DocumentMode::CLOUD_ACCOUNT)
+    {
+        // A presentation ends with the document driving it: the console window
+        // goes, and the window this document was playing in comes back out of
+        // full screen with its tab strip.
+        if (tab->hConsoleWnd)
+        {
+            PostMessageW(tab->hConsoleWnd, WM_CLOSE, 0, 0);
+            tab->hConsoleWnd = 0;
+        }
+        if (window.isPresFullScreen)
+        {
+            window.isPresFullScreen = false;
+            leave_full_screen(window);
+        }
+
+        // A document whose page never said hello has no forwarding thread to
+        // wake and no socket of its own to close yet. Once it has, the kit frees its data.
+        if (tab->app2js.joinable())
+        {
+            do_bye_handling_things(*tab);
+
+            // The goodbye closed the thread's end of the socket, so the thread
+            // is on its way out and joins straight away.
+            tab->app2js.join();
+        }
+        else if (!findBrokerByMobileAppDocId(tab->appDocId))
+            DocumentData::deallocate(tab->appDocId);
+
+        // A document whose tab lost its WebView2 stays loaded with no session until it is ended
+        // here. A document that has a session of its own is left as it is.
+        closeDetachedDocument(tab->appDocId);
+    }
+    else if (tab->mode == DocumentMode::CLOUD_ACCOUNT)
+    {
+        // The document of the editor iframe, once its page said hello.
+        if (tab->app2js.joinable())
+        {
+            do_bye_handling_things(*tab);
+            tab->app2js.join();
+        }
+    }
+
+    if (tab->webViewController)
+    {
+        tab->webViewController->Close();
+        tab->webViewController = nullptr;
+    }
+    tab->webView = nullptr;
+
+    documentTabs.erase(tabId);
+
+    removeTabFromWindow(window, tabId);
+}
+
+// A document the user may have edited goes only once its page answers CLOSE_WINDOW.
+static void requestCloseTab(HWND hWnd, int tabId)
+{
+    WindowState* window = findWindow(hWnd);
+    DocumentTab* tab = findTab(tabId);
+    if (!window || !tab)
+        return;
+
+    const bool mayHaveEdits = !tab->readyToClose && !tab->isConsole &&
+                              tab->mode != DocumentMode::STARTER &&
+                              tab->mode != DocumentMode::WELCOME;
+    const bool pageCanAnswer = tab->app2js.joinable() && tab->webView && tab->hasContent &&
+                               (tab->mode != DocumentMode::CLOUD_ACCOUNT || tab->editorFrame);
+    if (mayHaveEdits && pageCanAnswer)
+    {
+        const wchar_t* script =
+            L"(() => {"
+            L"  try {"
+            L"    if (window.app && window.app.map"
+            L"        && typeof window.app.map._saveAndClose === 'function')"
+            L"      window.app.map._saveAndClose();"
+            L"    else window.postMobileMessage('CLOSE_WINDOW');"
+            L"    return true;"
+            L"  } catch (e) {"
+            L"    try { window.postMobileMessage('CLOSE_WINDOW'); return true; }"
+            L"    catch (e) { return false; }"
+            L"  }"
+            L"})()";
+
+        // The tab closes anyway when the script cannot run, such as after the
+        // renderer process died, or when the frame has no CODA page to ask.
+        auto completed = Microsoft::WRL::Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+            [tabId](HRESULT errorCode, LPCWSTR result) -> HRESULT
+            {
+                const bool asked =
+                    SUCCEEDED(errorCode) && result && std::wstring_view(result) == L"true";
+                if (asked)
+                    return S_OK;
+                LOG_WRN("No CODA page in tab " << tabId << ", closing it: " << std::hex
+                                               << errorCode);
+                if (DocumentTab* closing = findTab(tabId))
+                {
+                    closing->readyToClose = true;
+                    PostMessageW(closing->hWnd, CODA_WM_CLOSETAB, (WPARAM)tabId, 0);
+                }
+                return S_OK;
+            });
+
+        if (tab->editorFrame)
+            tab->editorFrame->ExecuteScript(script, completed.Get());
+        else
+            tab->webView->ExecuteScript(script, completed.Get());
+        return;
+    }
+
+    const bool closingAll = window->closingAll;
+    closeTab(*window, tabId);
+    // The window is what is left of the last document, so it goes too. That frees its state.
+    if (window->tabIds.empty())
+    {
+        DestroyWindow(hWnd);
+        return;
+    }
+    // Posted rather than called, so the next document's page gets its turn to answer.
+    if (closingAll)
+        PostMessageW(hWnd, CODA_WM_CLOSETAB, (WPARAM)window->tabIds.front(), 0);
+}
+
+// Take a document out of the tab order of its window. If it was the one on show, the one that
+// moves up into its place, or the last one, comes to the front instead.
+static void removeTabFromWindow(WindowState& window, int tabId)
+{
+    const auto position = std::find(window.tabIds.begin(), window.tabIds.end(), tabId);
+    size_t index = 0;
+    if (position != window.tabIds.end())
+    {
+        index = static_cast<size_t>(std::distance(window.tabIds.begin(), position));
+        window.tabIds.erase(position);
+    }
+
+    if (window.tabIds.empty())
+    {
+        window.activeTabId = 0;
+        return;
+    }
+
+    if (window.activeTabId == tabId)
+    {
+        activateTab(window, window.tabIds[std::min(index, window.tabIds.size() - 1)]);
+    }
+    else
+    {
+        pushTabsToStrip(window);
+        focusActiveDocument(window);
+    }
+}
+
+static void reorderTab(WindowState& window, int fromIndex, int toIndex)
+{
+    const int count = static_cast<int>(window.tabIds.size());
+    if (fromIndex < 0 || fromIndex >= count || toIndex < 0 || toIndex >= count ||
+        fromIndex == toIndex)
+        return;
+
+    const int tabId = window.tabIds[fromIndex];
+    window.tabIds.erase(window.tabIds.begin() + fromIndex);
+    window.tabIds.insert(window.tabIds.begin() + toIndex, tabId);
+
+    pushTabsToStrip(window);
+    focusActiveDocument(window);
+}
+
+// Walk the tab order by one, wrapping at either end, and bring that document to the front.
+static void activateAdjacentTab(WindowState& window, int direction)
+{
+    const int count = static_cast<int>(window.tabIds.size());
+    if (count < 2)
+        return;
+
+    const auto position =
+        std::find(window.tabIds.begin(), window.tabIds.end(), window.activeTabId);
+    if (position == window.tabIds.end())
+        return;
+
+    const int index = static_cast<int>(std::distance(window.tabIds.begin(), position));
+    activateTab(window, window.tabIds[((index + direction) % count + count) % count]);
+}
+
+// The menu a right click on a tab brings up.
+static void showTabContextMenu(HWND hWnd, int tabId, POINT point)
+{
+    if (!findWindow(hWnd) || !findTab(tabId))
+        return;
+
+    hideHoverCard();
+
+    enum
+    {
+        CLOSE = 1,
+        CLOSE_OTHERS,
+        MOVE_TO_NEW_WINDOW
+    };
+
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, CLOSE, translate("TabManager", "Close").c_str());
+    AppendMenuW(menu, MF_STRING, CLOSE_OTHERS, translate("TabManager", "Close Others").c_str());
+    AppendMenuW(menu, MF_STRING, MOVE_TO_NEW_WINDOW,
+                translate("TabManager", "Move Tab to New Window").c_str());
+
+    ClientToScreen(hWnd, &point);
+    const int command = static_cast<int>(TrackPopupMenu(
+        menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, hWnd, nullptr));
+    DestroyMenu(menu);
+
+    // The menu runs a message loop of its own, which can have taken the window or the tab away.
+    WindowState* window = findWindow(hWnd);
+    if (!window || !findTab(tabId))
+        return;
+
+    // Each close is posted, as from a tab's close button, so the window goes with its last
+    // document.
+    if (command == CLOSE)
+    {
+        PostMessageW(hWnd, CODA_WM_CLOSETAB, (WPARAM)tabId, 0);
+    }
+    else if (command == CLOSE_OTHERS)
+    {
+        for (int otherId : window->tabIds)
+        {
+            if (otherId != tabId)
+                PostMessageW(hWnd, CODA_WM_CLOSETAB, (WPARAM)otherId, 0);
+        }
+    }
+    else if (command == MOVE_TO_NEW_WINDOW)
+    {
+        moveTabToNewWindow(hWnd, tabId);
+    }
+}
+
+// Ctrl+Tab and Ctrl+Shift+Tab move between the documents of a window. The app takes those keys
+// rather than leaving them to the page, because a document knows nothing about the other tabs.
+static void installTabSwitchAccelerator(ICoreWebView2Controller* controller)
+{
+    EventRegistrationToken token;
+    controller->add_AcceleratorKeyPressed(
+        Microsoft::WRL::Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
+            [](ICoreWebView2Controller* sender,
+               ICoreWebView2AcceleratorKeyPressedEventArgs* args) -> HRESULT
+            {
+                COREWEBVIEW2_KEY_EVENT_KIND kind;
+                UINT key;
+                if (FAILED(args->get_KeyEventKind(&kind)) ||
+                    FAILED(args->get_VirtualKey(&key)))
+                    return S_OK;
+
+                if (kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN &&
+                    kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN)
+                    return S_OK;
+
+                if (key != VK_TAB || !(GetKeyState(VK_CONTROL) & 0x8000))
+                    return S_OK;
+
+                // The window the WebView2 is in now, as a document can move to another one.
+                HWND hWnd;
+                if (FAILED(sender->get_ParentWindow(&hWnd)))
+                    return S_OK;
+
+                const WindowState* window = findWindow(hWnd);
+                if (!window)
+                    return S_OK;
+
+                // A full-screen presentation hides the tab strip, and the key does nothing there.
+                if (window->isFullScreen)
+                {
+                    args->put_Handled(TRUE);
+                    return S_OK;
+                }
+
+                // A window showing a single document has no other tab to move to, so the
+                // key belongs to the document.
+                if (window->tabIds.size() < 2)
+                    return S_OK;
+
+                const int direction = (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1;
+                PostMessageW(hWnd, CODA_WM_ACTIVATEADJACENTTAB, (WPARAM)direction, 0);
+
+                args->put_Handled(TRUE);
+                return S_OK;
+            })
+            .Get(),
+        &token);
+}
+
+static void openStarterWindow();
+
+// What the tab strip page asks of the app, as {call, args}.
+static void processStripMessage(WindowState& window, const std::string& message)
+{
+    Poco::JSON::Object::Ptr object;
+    if (!JsonUtil::parseJSON(message, object))
+    {
+        LOG_ERR("Unparseable message from the tab strip: '" << message << "'");
+        return;
+    }
+
+    const std::string call = object->optValue<std::string>("call", std::string());
+    Poco::JSON::Array::Ptr args = object->getArray("args");
+    const std::size_t argCount = args ? args->size() : 0;
+
+    if (call == "requestSync")
+    {
+        // The page has its handlers in place and wants the state it missed.
+        notifyStrip(window, "themeChanged", currentStripTheme());
+        pushTabsToStrip(window);
+    }
+    else if (call == "tabActivated" && argCount >= 1)
+    {
+        activateTab(window, args->getElement<int>(0));
+    }
+    else if (call == "tabCloseRequested" && argCount >= 1)
+    {
+        PostMessageW(window.hWnd, CODA_WM_CLOSETAB, (WPARAM)args->getElement<int>(0), 0);
+    }
+    else if (call == "tabContextMenuRequested" && argCount >= 3)
+    {
+        POINT point = stripPointToScreen(window, args->getElement<double>(1),
+                                         args->getElement<double>(2));
+        ScreenToClient(window.hWnd, &point);
+        PostMessageW(window.hWnd, CODA_WM_SHOWTABMENU, (WPARAM)args->getElement<int>(0),
+                     MAKELPARAM(point.x, point.y));
+    }
+    else if (call == "tabReordered" && argCount >= 2)
+    {
+        reorderTab(window, args->getElement<int>(0), args->getElement<int>(1));
+    }
+    else if (call == "newTabRequested")
+    {
+        openStarterWindow();
+    }
+    else if (call == "debug" && argCount >= 1)
+    {
+        LOG_DBG("From the tab strip: " << args->getElement<std::string>(0));
+    }
+    else if (call == "tabDragEnded" && argCount >= 2)
+    {
+        // A drop on the strip has already reordered the tabs. The page sees no difference between
+        // a drag cancelled with Escape and a drop that nothing took, so the key is checked here.
+        if (args->getElement<bool>(1) || (GetAsyncKeyState(VK_ESCAPE) & 0x8000))
+            return;
+
+        // A tab released over the desktop, or over another application, moves out into a window
+        // of its own, as with the context menu. The drop overlay belongs to the document window
+        // that owns it.
+        const int tabId = args->getElement<int>(0);
+        POINT point;
+        if (!GetCursorPos(&point))
+            return;
+        const HWND root = GetAncestor(WindowFromPoint(point), GA_ROOT);
+        WindowState* target = root ? findWindow(root) : nullptr;
+        if (!target && root)
+            target = findWindow(GetWindow(root, GW_OWNER));
+        if (!target)
+        {
+            PostMessageW(window.hWnd, CODA_WM_MOVETABTONEWWINDOW, (WPARAM)tabId,
+                         MAKELPARAM(point.x, point.y));
+            return;
+        }
+
+        // Released over the document of another tabbed window, the tab joins that window at the
+        // end. A drop on the strip of that window arrives from its page as
+        // tabAdoptFromOtherWindow instead, with the position in the tab order.
+        if (target == &window || !target->isTabbed)
+            return;
+        RECT strip = stripBounds(*target);
+        MapWindowPoints(target->hWnd, HWND_DESKTOP, reinterpret_cast<POINT*>(&strip), 2);
+        if (PtInRect(&strip, point))
+            return;
+        PostMessageW(target->hWnd, CODA_WM_MOVETABTOWINDOW, (WPARAM)tabId, (LPARAM)-1);
+    }
+    else if (call == "tabAdoptFromOtherWindow" && argCount >= 2)
+    {
+        PostMessageW(window.hWnd, CODA_WM_MOVETABTOWINDOW, (WPARAM)args->getElement<int>(0),
+                     (LPARAM)args->getElement<int>(1));
+    }
+    else if (call == "tabHoverStarted" && argCount >= 8)
+    {
+        const POINT point = { static_cast<LONG>(std::lround(args->getElement<double>(1))),
+                              static_cast<LONG>(std::lround(args->getElement<double>(2))) };
+        startHoverCard(window, args->getElement<int>(0), point, args->getElement<std::string>(3),
+                       args->getElement<std::string>(4), args->getElement<std::string>(5),
+                       args->getElement<bool>(6), args->getElement<std::string>(7));
+    }
+    else if (call == "tabHoverEnded")
+    {
+        hideHoverCard();
+    }
+    else if (call == "tabDragStarted" || call == "targetDragOver")
+    {
+        // The app learns where a tab drag ended from tabDragEnded, and from the drop calls of the
+        // strip it ended on, so it does not follow the drag as it goes. The start of a drag only
+        // takes the hover card away.
+        if (call == "tabDragStarted")
+            hideHoverCard();
+    }
+    else
+    {
+        LOG_ERR("Unhandled message from the tab strip: '" << message << "'");
+    }
+}
+
+// The tab strip is the same page CODA-Q draws, in a web view of its own along the top of the
+// window.
+static void createTabStrip(WindowState& window)
+{
+    const HWND hWnd = window.hWnd;
+
+    withWebView2Environment(
+        [hWnd](ICoreWebView2Environment* env)
+        {
+            env->CreateCoreWebView2Controller(
+                hWnd,
+                Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                    [hWnd](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT
+                    {
+                        WindowState* window = findWindow(hWnd);
+                        if (!controller || !window)
+                            return E_FAIL;
+
+                        ICoreWebView2* webView;
+                        controller->get_CoreWebView2(&webView);
+                        window->stripWebView = wil::com_ptr<ICoreWebView2>(webView);
+                        window->stripController = controller;
+
+                        wil::com_ptr<ICoreWebView2Settings> settings;
+                        webView->get_Settings(&settings);
+                        settings->put_IsScriptEnabled(TRUE);
+                        settings->put_IsWebMessageEnabled(TRUE);
+                        settings->put_AreDefaultContextMenusEnabled(FALSE);
+                        // The strip is part of the window frame rather than content, so it stays at
+                        // one scale. Ctrl with the wheel and the keyboard shortcuts go through
+                        // IsZoomControlEnabled, and a touch pinch has its own setting on
+                        // ICoreWebView2Settings5.
+                        settings->put_IsZoomControlEnabled(FALSE);
+                        wil::com_ptr<ICoreWebView2Settings5> settings5
+                            = settings.try_query<ICoreWebView2Settings5>();
+                        if (settings5)
+                            settings5->put_IsPinchZoomEnabled(FALSE);
+                        // The strip stays on the one page it loaded, so a horizontal swipe across
+                        // it does not navigate.
+                        wil::com_ptr<ICoreWebView2Settings6> settings6
+                            = settings.try_query<ICoreWebView2Settings6>();
+                        if (settings6)
+                            settings6->put_IsSwipeNavigationEnabled(FALSE);
+                        // The page marks the space around the tabs with app-region: drag, and a
+                        // drag there moves the window as a drag on the title bar does.
+                        wil::com_ptr<ICoreWebView2Settings9> settings9
+                            = settings.try_query<ICoreWebView2Settings9>();
+                        if (settings9)
+                            settings9->put_IsNonClientRegionSupportEnabled(TRUE);
+
+                        EventRegistrationToken token;
+                        webView->add_WebMessageReceived(
+                            Microsoft::WRL::Callback<ICoreWebView2WebMessageReceivedEventHandler>(
+                                [hWnd](ICoreWebView2* sender,
+                                       ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT
+                                {
+                                    WindowState* window = findWindow(hWnd);
+                                    if (!window)
+                                        return S_OK;
+
+                                    // The page posts an object, so the message
+                                    // arrives as JSON rather than as a string.
+                                    wil::unique_cotaskmem_string json;
+                                    if (SUCCEEDED(args->get_WebMessageAsJson(&json)))
+                                        processStripMessage(
+                                            *window, Util::wide_string_to_string(json.get()));
+                                    return S_OK;
+                                })
+                                .Get(),
+                            &token);
+
+                        installTabSwitchAccelerator(controller);
+
+                        controller->put_IsVisible(FALSE);
+                        controller->put_Bounds(stripBounds(*window));
+
+                        // As for a document, the strip appears only once it has something styled
+                        // to show, so the window frame covers the gap instead of a white page.
+                        EventRegistrationToken readyToken;
+                        if (auto stripWebView2 = window->stripWebView.try_query<ICoreWebView2_2>())
+                            stripWebView2->add_DOMContentLoaded(
+                                Microsoft::WRL::Callback<ICoreWebView2DOMContentLoadedEventHandler>(
+                                    [hWnd](ICoreWebView2* sender,
+                                           ICoreWebView2DOMContentLoadedEventArgs* args) -> HRESULT
+                                    {
+                                        WindowState* stripWindow = findWindow(hWnd);
+                                        if (stripWindow && !stripWindow->stripHasContent)
+                                        {
+                                            stripWindow->stripHasContent = true;
+                                            if (stripWindow->stripController)
+                                                stripWindow->stripController->put_IsVisible(
+                                                    stripWindow->stripIsVisible);
+                                        }
+                                        return S_OK;
+                                    })
+                                    .Get(),
+                                &readyToken);
+
+                        // A text of the strip in the user interface language, as a parameter
+                        // of the query string.
+                        const auto textParameter = [](const char* name, const std::wstring& text)
+                        {
+                            std::string encoded;
+                            Poco::URI::encode(Util::wide_string_to_string(text), "&=+#?", encoded);
+                            return std::string("&") + name + "=" + encoded;
+                        };
+
+                        // The page reads the theme out of the query string, so
+                        // it is in the right colours from its first paint.
+                        const std::string stripURL =
+                            app_installation_uri + "../cool/qtapp-tabstrip.html?darkTheme=" +
+                            (currentStripTheme() == "dark" ? "true" : "false") + "&titleBar=true" +
+                            // The tabs run from right to left in a language written that way, as
+                            // the document UI does.
+                            (LangUtil::isRtlLanguage(uiLanguage) ? "&dir=rtl" : "") +
+                            //: Tooltip of the button that closes a tab
+                            textParameter("closeTabText", translate("TabManager", "Close tab")) +
+                            //: Tooltip of the + button at the end of the tab strip
+                            textParameter("newText", translate("TabManager", "New")) +
+                            //: The name in a tab whose document has no name
+                            textParameter("untitledText", translate("TabManager", "(untitled)"));
+                        webView->Navigate(Util::string_to_wide_string(stripURL).c_str());
+
+                        return S_OK;
+                    })
+                    .Get());
+        });
+}
+
+// The web view of one document, in the window its tab belongs to. The document
+// itself is loaded once the page reports back with HULLO.
+static void createDocumentView(int tabId)
+{
+    if (DocumentTab* tab = findTab(tabId))
+        tab->viewLiveSince = GetTickCount64();
+
+    withWebView2Environment(
+        [tabId](ICoreWebView2Environment* env)
+        {
+            DocumentTab* tab = findTab(tabId);
+            if (!tab)
+                return;
+
+            // Create a CoreWebView2Controller and get the associated CoreWebView2 whose parent is
+            // the window the document is shown in
+            env->CreateCoreWebView2Controller(
+                tab->hWnd,
+                Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                    [tabId, env](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT
+                    {
+                        DocumentTab* data = findTab(tabId);
+                        if (!controller || !data)
+                            return E_FAIL;
+
+                        ICoreWebView2* webView;
+                        controller->get_CoreWebView2(&webView);
+                        data->webView = wil::com_ptr<ICoreWebView2>(webView);
+                        data->webViewController = controller;
+
+                        wil::com_ptr<ICoreWebView2_22> webView22 = data->webView.try_query<ICoreWebView2_22>();
+                        if (!webView22)
+                            fatal("Could not get webView22");
+
+                        // Add a few settings for the webview
+                        // The demo step is redundant since the values are the default settings
+                        wil::com_ptr<ICoreWebView2Settings> settings;
+                        webView->get_Settings(&settings);
+                        settings->put_IsScriptEnabled(TRUE);
+                        settings->put_AreDefaultScriptDialogsEnabled(TRUE);
+                        settings->put_IsWebMessageEnabled(TRUE);
+                        // Stop browser shortcut keys (such as F12 for the
+                        // developer tools and F5 for reload) from being
+                        // handled by the WebView, so the keys reach the
+                        // document instead. F12 then toggles the numbered
+                        // list rather than opening the developer tools.
+                        wil::com_ptr<ICoreWebView2Settings4> settings4
+                            = settings.try_query<ICoreWebView2Settings4>();
+                        if (settings4)
+                            settings4->put_AreBrowserAcceleratorKeysEnabled(FALSE);
+
+                        // The document can have moved to another window while its WebView2 was
+                        // being made.
+                        controller->put_ParentWindow(data->hWnd);
+
+                        installTabSwitchAccelerator(controller);
+
+                        // Fit the WebView to the part of the window below the tab strip. It stays
+                        // hidden until its page has something styled to show, so what fills the
+                        // window until then is the frame, in the colour of the theme.
+                        WindowState* window = findWindow(data->hWnd);
+                        if (window)
+                        {
+                            controller->put_Bounds(documentArea(*window));
+                            controller->put_IsVisible(FALSE);
+                        }
+
+                        // The page has parsed its document and the stylesheets that block its
+                        // first paint. A navigation that fails reaches the second of these and
+                        // not the first, and an empty document view is still better than one
+                        // that never appears.
+                        EventRegistrationToken readyToken;
+                        auto showWhenReady = [tabId]()
+                        {
+                            DocumentTab* tab = findTab(tabId);
+                            WindowState* tabWindow = tab ? findWindow(tab->hWnd) : nullptr;
+                            if (!tab || !tabWindow || tab->hasContent)
+                                return;
+
+                            tab->hasContent = true;
+                            if (tabWindow->activeTabId != tabId || !tab->webViewController)
+                                return;
+
+                            tab->webViewController->put_IsVisible(TRUE);
+                            tab->webViewController->MoveFocus(
+                                COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+                        };
+
+                        if (auto webView2 = data->webView.try_query<ICoreWebView2_2>())
+                            webView2->add_DOMContentLoaded(
+                                Microsoft::WRL::Callback<ICoreWebView2DOMContentLoadedEventHandler>(
+                                    [showWhenReady](ICoreWebView2* sender,
+                                                    ICoreWebView2DOMContentLoadedEventArgs* args)
+                                        -> HRESULT
+                                    {
+                                        showWhenReady();
+                                        return S_OK;
+                                    })
+                                    .Get(),
+                                &readyToken);
+
+                        webView->add_NavigationCompleted(
+                            Microsoft::WRL::Callback<ICoreWebView2NavigationCompletedEventHandler>(
+                                [showWhenReady](ICoreWebView2* sender,
+                                                ICoreWebView2NavigationCompletedEventArgs* args)
+                                    -> HRESULT
+                                {
+                                    showWhenReady();
+                                    return S_OK;
+                                })
+                                .Get(),
+                            &readyToken);
+
+                        EventRegistrationToken token;
+                        HRESULT hr;
+
+                        hr = (webView22->AddWebResourceRequestedFilterWithRequestSourceKinds(
+                                  L"cool://*",
+                                  COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                                  COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL));
+                        if (!SUCCEEDED(hr))
+                        {
+                            LOG_ERR_S("AddWebResourceRequestedFilterWithRequestSourceKinds() failed");
+                            return hr;
+                        }
+
+                        // Embedded media has its own https host, see CODA_MEDIA_HOST.
+                        hr = (webView22->AddWebResourceRequestedFilterWithRequestSourceKinds(
+                                  (L"https://" + Util::string_to_wide_string(CODA_MEDIA_HOST) +
+                                   L"/*")
+                                      .c_str(),
+                                  COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                                  COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL));
+                        if (!SUCCEEDED(hr))
+                        {
+                            LOG_ERR_S("AddWebResourceRequestedFilterWithRequestSourceKinds() for "
+                                      "the media host failed");
+                            return hr;
+                        }
+
+                        hr = webView->add_WebResourceRequested(
+                            Microsoft::WRL::Callback<ICoreWebView2WebResourceRequestedEventHandler>(
+                                [env](ICoreWebView2* sender,
+                                      ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT
+                                {
+                                    return webResourceRequestedHandler(env, sender, args);
+                                }).Get(), &token);
+
+                        if (!SUCCEEDED(hr))
+                        {
+                            LOG_ERR_S("add_WebResourceRequested() failed");
+                            return hr;
+                        }
+
+                        // Communication between host and web content
+                        // Set an event handler for the host to return received message back to the web content
+                        webView->add_WebMessageReceived(
+                            Microsoft::WRL::Callback<
+                                ICoreWebView2WebMessageReceivedEventHandler>(
+                                [tabId](
+                                    ICoreWebView2* webView,
+                                    ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT
+                                {
+                                    DocumentTab* tab = findTab(tabId);
+                                    if (!tab)
+                                        return S_OK;
+
+                                    wil::unique_cotaskmem_string message;
+                                    args->TryGetWebMessageAsString(&message);
+                                    processMessage(*tab, message);
+                                    return S_OK;
+                                })
+                                .Get(),
+                            &token);
+
+                        webView->add_ContainsFullScreenElementChanged(
+                            Microsoft::WRL::Callback<ICoreWebView2ContainsFullScreenElementChangedEventHandler>(
+                                [tabId](ICoreWebView2* sender, IUnknown* args) -> HRESULT
+                                {
+                                    DocumentTab* tab = findTab(tabId);
+                                    WindowState* window = tab ? findWindow(tab->hWnd) : nullptr;
+                                    if (!window)
+                                        return S_OK;
+
+                                    BOOL containsFullscreenElement;
+                                    sender->get_ContainsFullScreenElement(&containsFullscreenElement);
+                                    if (containsFullscreenElement)
+                                    {
+                                        HMONITOR monitor = MonitorFromWindow(tab->hWnd, MONITOR_DEFAULTTONEAREST);
+                                        enter_full_screen(*window, monitor, true);
+                                    }
+                                    else
+                                        leave_full_screen(*window);
+                                    return S_OK;
+                                })
+                                .Get(),
+                            nullptr);
+
+                        // New windows appear to need to reuse the original env of the parent, a good explanation
+                        // of use at: https://github.com/MicrosoftEdge/WebView2Feedback/discussions/4501#discussioncomment-9215801
+                        webView->add_NewWindowRequested(
+                            Microsoft::WRL::Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+                                [env, tabId](ICoreWebView2* sender, ICoreWebView2NewWindowRequestedEventArgs* args)
+                                {
+                                    DocumentTab* data = findTab(tabId);
+                                    if (!data)
+                                        return S_OK;
+
+                                    wil::com_ptr<ICoreWebView2Deferral> deferral;
+                                    args->GetDeferral(&deferral);
+
+                                    HMONITOR hMonitor = MonitorFromWindow(data->hWnd, MONITOR_DEFAULTTONEAREST);
+                                    MONITORINFO monitorInfo = { sizeof(monitorInfo) };
+                                    GetMonitorInfo(hMonitor, &monitorInfo);
+                                    const RECT& area = monitorInfo.rcWork;
+                                    int areaWidth = area.right - area.left;
+                                    int areaHeight = area.bottom - area.top;
+                                    int width = areaWidth * 17 / 20;
+                                    int height = areaHeight * 17 / 20;
+                                    int x = area.left + (areaWidth - width) / 2;
+                                    int y = area.top + (areaHeight - height) / 2;
+
+                                    // The presenter console is a window of its own rather than a
+                                    // tab: it plays full screen on the monitor the presentation
+                                    // does not use.
+                                    data->hConsoleWnd = CreateWindowW(windowClass,
+                                            Util::string_to_wide_string(APP_NAME).c_str(),
+                                            WS_OVERLAPPEDWINDOW,
+                                            x, y, width, height,
+                                            NULL, NULL, appInstance, NULL);
+
+                                    WindowState& consoleWindow = windows[data->hConsoleWnd];
+                                    consoleWindow.hWnd = data->hConsoleWnd;
+
+                                    DocumentTab& consoleTab = createTab(consoleWindow, {},
+                                                                        DocumentMode::EDIT);
+                                    consoleTab.isConsole = true;
+                                    consoleTab.presentingTabId = tabId;
+                                    consoleWindow.activeTabId = consoleTab.tabId;
+                                    const int consoleTabId = consoleTab.tabId;
+
+                                    ShowWindow(data->hConsoleWnd, appShowMode);
+
+                                    env->CreateCoreWebView2Controller(
+                                        data->hConsoleWnd,
+                                        Microsoft::WRL::Callback<
+                                            ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                                            [consoleTabId, tabId, args, deferral](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT
+                                            {
+                                                DocumentTab* consoleData = findTab(consoleTabId);
+                                                DocumentTab* presenting = findTab(tabId);
+                                                if (!controller || !consoleData || !presenting)
+                                                    return E_FAIL;
+
+                                                ICoreWebView2* webView;
+                                                controller->get_CoreWebView2(&webView);
+                                                consoleData->webView = wil::com_ptr<ICoreWebView2>(webView);
+
+                                                webView->add_WindowCloseRequested(
+                                                    Microsoft::WRL::Callback<ICoreWebView2WindowCloseRequestedEventHandler>(
+                                                        [consoleTabId](ICoreWebView2* sender, IUnknown* args)
+                                                        {
+                                                            DocumentTab* consoleData = findTab(consoleTabId);
+                                                            if (consoleData)
+                                                                PostMessageW(consoleData->hWnd, WM_CLOSE, 0, 0);
+                                                            return S_OK;
+                                                        })
+                                                        .Get(),
+                                                    nullptr);
+
+                                                controller->put_IsVisible(TRUE);
+
+                                                consoleData->webViewController = controller;
+
+                                                // Resize WebView to fit the bounds of the parent window
+                                                RECT bounds;
+                                                GetClientRect(consoleData->hWnd, &bounds);
+                                                controller->put_Bounds(bounds);
+
+                                                args->put_NewWindow(consoleData->webView.get());
+                                                args->put_Handled(TRUE);
+                                                deferral->Complete();
+
+                                                arrangePresentationWindows(*presenting);
+
+                                                return S_OK;
+                                            })
+                                            .Get());
+
+                                    return S_OK;
+                                })
+                                .Get(),
+                            nullptr);
+
+                        std::string coolURL =
+                            app_installation_uri + "../cool/cool.html?";
+                        if (data->mode == DocumentMode::STARTER)
+                            coolURL += "starterMode=true";
+                        else
+                        {
+                            coolURL +=
+                                "file_path=" + data->filenameAndUri.uri +
+                                std::string("&permission=edit") +
+                                std::string("&appdocid=") + std::to_string(data->appDocId) +
+                                std::string("&userinterfacemode=notebookbar");
+                        }
+
+                        coolURL += "&lang=" + uiLanguage;
+                        coolURL += "&dir=" + std::string(LangUtil::isRtlLanguage(uiLanguage) ? "rtl" : "");
+
+                        // Saved choice wins, otherwise follow the system theme.
+                        coolURL += darkModeEnabled() ? "&darkTheme=true" : "&darkTheme=false";
+
+                        if (data->mode != DocumentMode::STARTER)
+                            coolURL +=
+                                std::string((data->mode != DocumentMode::NEW ? "&startreadonly=true" : "")) +
+                                std::string((data->mode == DocumentMode::WELCOME ? "&welcome=true" : ""));
+
+                        webView->Navigate(Util::string_to_wide_string(coolURL).c_str());
+
+                        return S_OK;
+                    })
+                    .Get());
+        });
+}
+
+// Set up a top-level window of the app's own class, ready to take documents.
+static WindowState& createAppWindow(const std::wstring& title, DWORD style, int x, int y,
+                                    int width, int height)
+{
+    const HWND hWnd = CreateWindowW(windowClass, title.c_str(), style, x, y, width, height,
+                                    NULL, NULL, appInstance, NULL);
+
+    WindowState& window = windows[hWnd];
+    window.hWnd = hWnd;
+
+    ShowWindow(hWnd, appShowMode);
+    UpdateWindow(hWnd);
+
+    AddClipboardFormatListener(hWnd);
+
+    return window;
+}
+
+// Set size of document window to be 90% of monitor width and height.
+//
+// FIXME: Should we actually, at least for text documents, ideally peek into the document and
+// check what its page size is, and in the common case of a portrait orientation text document,
+// make the document window also (if the monitor is large enough) higher than wider? On small
+// monitors (1280x768 or less?) we should probably default to making the document window
+// full-screen?
+//
+// FIXME: My initial assumption that the COOL window would open up on the monitor where the
+// file section dialog was is incorrect.
+static void defaultWindowSize(int& width, int& height)
+{
+    MONITORINFO monitorInfo;
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (GetMonitorInfoW(primaryMonitor, &monitorInfo))
+    {
+        width = 0.9 * (monitorInfo.rcWork.right - monitorInfo.rcWork.left);
+        height = 0.9 * (monitorInfo.rcWork.bottom - monitorInfo.rcWork.top);
+    }
+    else
+    {
+        width = 1200;
+        height = 900;
+    }
+}
+
+// A new window that shows documents as tabs. It goes once its last tab closes. Given a point of the
+// screen, the window comes up with that point on its title bar, and inside the work area of the
+// monitor the point is on.
+static WindowState& createTabbedWindow(const POINT* titleBarPoint = nullptr)
+{
+    int width, height;
+    defaultWindowSize(width, height);
+
+    int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+    if (titleBarPoint)
+    {
+        x = titleBarPoint->x - width / 2;
+        y = titleBarPoint->y - GetSystemMetrics(SM_CYSIZEFRAME) -
+            GetSystemMetrics(SM_CXPADDEDBORDER) - GetSystemMetrics(SM_CYCAPTION) / 2;
+
+        // The default size is taken from the primary monitor, which can be larger than this one.
+        MONITORINFO monitorInfo;
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        if (GetMonitorInfoW(MonitorFromPoint(*titleBarPoint, MONITOR_DEFAULTTONEAREST),
+                            &monitorInfo))
+        {
+            const RECT& work = monitorInfo.rcWork;
+            width = std::min(width, static_cast<int>(work.right - work.left));
+            height = std::min(height, static_cast<int>(work.bottom - work.top));
+            x = std::clamp(x, static_cast<int>(work.left), static_cast<int>(work.right) - width);
+            y = std::clamp(y, static_cast<int>(work.top), static_cast<int>(work.bottom) - height);
+        }
+    }
+
+    WindowState& window = createAppWindow(Util::string_to_wide_string(APP_NAME),
+                                          WS_OVERLAPPEDWINDOW, x, y, width, height);
+    window.isTabbed = true;
+    tabbedWindow = window.hWnd;
+
+    // In a language written from right to left the window is mirrored, as the tab strip is, so the
+    // strip starts at the right and the caption buttons are at the left. The web views in it are
+    // not mirrored, as their pages lay themselves out from the dir parameter.
+    if (LangUtil::isRtlLanguage(uiLanguage))
+        SetWindowLongW(window.hWnd, GWL_EXSTYLE,
+                       GetWindowLongW(window.hWnd, GWL_EXSTYLE) | WS_EX_LAYOUTRTL |
+                           WS_EX_NOINHERITLAYOUT);
+
+    // The window was created before it was known to be tabbed, so its frame and the colour of its
+    // title bar are computed again.
+    applyTitleBarTheme(window.hWnd);
+
+    createTabStrip(window);
+
+    return window;
+}
+
+// The tabbed window that a newly opened document goes to, made with the first document.
+static WindowState& getOrCreateTabbedWindow()
+{
+    WindowState* existing = findWindow(tabbedWindow);
+    if (existing)
+        return *existing;
+
+    return createTabbedWindow();
+}
+
+// Take a document out of its window, and show it in another tabbed window, at the position
+// insertAt in the tab order of that window, or at the end when insertAt is -1. The WebView2 moves
+// with it, so the document stays loaded as it is. The window it leaves goes if it has no other
+// document.
+static void moveTabToWindow(int tabId, WindowState& target, int insertAt)
+{
+    DocumentTab* tab = findTab(tabId);
+    WindowState* source = tab ? findWindow(tab->hWnd) : nullptr;
+    if (!source || source == &target || !source->isTabbed || !target.isTabbed ||
+        target.isFullScreen)
+        return;
+
+    removeTabFromWindow(*source, tabId);
+
+    tab->hWnd = target.hWnd;
+    const int count = static_cast<int>(target.tabIds.size());
+    target.tabIds.insert(target.tabIds.begin() +
+                             (insertAt < 0 || insertAt > count ? count : insertAt),
+                         tabId);
+    if (tab->webViewController)
+    {
+        tab->webViewController->put_ParentWindow(target.hWnd);
+        tab->webViewController->put_Bounds(documentArea(target));
+    }
+
+    activateTab(target, tabId);
+    SetForegroundWindow(target.hWnd);
+
+    // The WebView2 has a new parent by now, so it lives on when the window it left goes.
+    if (source->tabIds.empty())
+        DestroyWindow(source->hWnd);
+}
+
+// Take a document out of its window, and show it in a new tabbed window of its own, with the title
+// bar at the drop point when there is one.
+static void moveTabToNewWindow(HWND hWnd, int tabId, const POINT* dropPoint)
+{
+    WindowState* source = findWindow(hWnd);
+    DocumentTab* tab = findTab(tabId);
+    if (!source || !tab || tab->hWnd != hWnd || source->tabIds.size() < 2)
+        return;
+
+    moveTabToWindow(tabId, createTabbedWindow(dropPoint), -1);
+}
+
+// The window the welcome slideshow plays in. It is displayed without
+// decorations, and at 16:9 because we know it is that aspect ratio.
+static WindowState& createWelcomeWindow()
+{
+    int width, height;
+    int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+
+    MONITORINFO monitorInfo;
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (GetMonitorInfoW(primaryMonitor, &monitorInfo))
+    {
+        double aspectRatio =
+            (double)(monitorInfo.rcWork.right - monitorInfo.rcWork.left) / (monitorInfo.rcWork.bottom - monitorInfo.rcWork.top);
+        if (aspectRatio < 16.0/9.0)
+        {
+            width = 0.9 * (monitorInfo.rcWork.right - monitorInfo.rcWork.left);
+            x = monitorInfo.rcWork.left + 0.05 * (monitorInfo.rcWork.right - monitorInfo.rcWork.left);
+            height = width / (16.0/9.0);
+            y = monitorInfo.rcWork.top + ((monitorInfo.rcWork.bottom - monitorInfo.rcWork.top) - height) / 2;
+        }
+        else
+        {
+            height = 0.9 * (monitorInfo.rcWork.bottom - monitorInfo.rcWork.top);
+            y = monitorInfo.rcWork.top + 0.05 * (monitorInfo.rcWork.bottom - monitorInfo.rcWork.top);
+            width = (16.0/9.0) * height;
+            x = monitorInfo.rcWork.left + ((monitorInfo.rcWork.right - monitorInfo.rcWork.left) - width) / 2;
+        }
+    }
+    else
+    {
+        width = 1280;
+        height = 720;
+    }
+
+    return createAppWindow(Util::string_to_wide_string(APP_NAME), WS_POPUP, x, y, width, height);
+}
+
+// Find out whether the document is already open, and return its tab if it is.
+static DocumentTab* findOpenDocumentTab(const std::string& uri)
+{
+    if (uri.empty())
+        return nullptr;
+
+    const std::string path = fileUriToWindowsPath(uri);
+    for (auto& i : documentTabs)
+    {
+        if (fileUriToWindowsPath(i.second.filenameAndUri.uri) == path)
+            return &i.second;
+    }
+    return nullptr;
+}
+
+static void openCOOLWindow(const FilenameAndUri& filenameAndUri, DocumentMode mode)
+{
+    // Don't open an already open document in a new tab, switch to its tab instead.
+    if (mode == DocumentMode::EDIT)
+    {
+        if (DocumentTab* openTab = findOpenDocumentTab(filenameAndUri.uri))
+        {
+            if (WindowState* openWindow = findWindow(openTab->hWnd))
+            {
+                SetForegroundWindow(openWindow->hWnd);
+                activateTab(*openWindow, openTab->tabId);
+            }
+            // Go on with the rest when several documents are opened at once.
+            load_next_document();
+            return;
+        }
+    }
+
+    // The welcome slideshow and the starter backstage each get a window to
+    // themselves: neither is a document the user works in alongside others.
+    WindowState* window = nullptr;
+    if (mode == DocumentMode::WELCOME)
+    {
+        window = &createWelcomeWindow();
+    }
+    else if (mode == DocumentMode::STARTER)
+    {
+        int width, height;
+        defaultWindowSize(width, height);
+        window = &createAppWindow(Util::string_to_wide_string(APP_NAME), WS_OVERLAPPEDWINDOW,
+                                  CW_USEDEFAULT, CW_USEDEFAULT, width, height);
+    }
+    else
+    {
+        window = &getOrCreateTabbedWindow();
+        // The document the user just asked for comes to the front.
+        SetForegroundWindow(window->hWnd);
+    }
+
+    DocumentTab& tab = createTab(*window, filenameAndUri, mode);
+    if (mode != DocumentMode::STARTER)
+    {
+        tab.fakeClientFd = fakeSocketSocket();
+        tab.appDocId = generate_new_app_doc_id();
+    }
+    if (mode != DocumentMode::STARTER && mode != DocumentMode::WELCOME)
+        recentFiles.add(filenameAndUri.uri);
+
+    activateTab(*window, tab.tabId);
+    createDocumentView(tab.tabId);
+}
+
+static void openStarterWindow()
+{
+    // One backstage is enough: a second ask brings the open one forward.
+    for (const auto& i : documentTabs)
+    {
+        if (i.second.mode == DocumentMode::STARTER)
+        {
+            SetForegroundWindow(i.second.hWnd);
+            return;
+        }
+    }
+
+    openCOOLWindow({}, DocumentMode::STARTER);
+}
+
+/// 2 MiB. The form an integrator posts for a document is about 5 KB.
+constexpr size_t MAX_FORM_BYTES = 2 * 1024 * 1024;
+constexpr ULONG FORM_CHUNK_BYTES = 4096;
+
+/// In the editor's iframe, replaces coolwsd's page with an empty document before it is parsed.
+constexpr const char* EMPTY_COOL_PAGE_SCRIPT = R"JS(
+if (window !== window.top && location.pathname.endsWith('/cool.html')) {
+    document.open();
+    document.close();
+}
+)JS";
+
+/// Builds CODA's editor page in the emptied editor iframe. It posts the integrator's form again to
+/// get coolwsd's settings, then loads CODA's page, scripts and styles from config.base.
+/// TODO: Share this and EMPTY_COOL_PAGE_SCRIPT with Qt's copies in qt/RemoteOpen.cpp.
+constexpr const char* PUT_CODA_PAGE_IN_SCRIPT = R"JS(
+(config) => {
+    if (window.codaRemotePage)
+        return;
+
+    window.codaRemotePage = { base: config.base };
+
+    const text = (response) => {
+        if (!response.ok)
+            throw new Error('a request returned ' + response.status);
+        return response.text();
+    };
+
+    const serverPage = fetch(config.formUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: config.formBody,
+    }).then(text);
+
+    const appPage = fetch(config.base + 'cool.html').then(text);
+
+    Promise.all([serverPage, appPage]).then(([serverHtml, appHtml]) => {
+        // coolwsd writes the values for its editor into these two elements.
+        const server = new DOMParser().parseFromString(serverHtml, 'text/html');
+        const variables = server.getElementById('initial-variables');
+        const cssVariables = server.getElementById('init-css-vars');
+
+        window.codaRemotePage.serverVariables = variables ? { ...variables.dataset } : {};
+        window.codaRemotePage.cssVariables = cssVariables ? cssVariables.value : '';
+
+        const app = new DOMParser().parseFromString(appHtml, 'text/html');
+        const isRelative = (address) => address && !address.includes(':');
+
+        for (const link of app.querySelectorAll('link[href]'))
+            if (isRelative(link.getAttribute('href')))
+                link.href = config.base + link.getAttribute('href');
+
+        // Remove the scripts from CODA's cool.html: moved scripts never run. We add them again
+        // later from config.base, so that they are loaded from CODA.
+        const scripts = Array.from(app.scripts);
+        scripts.forEach((script) => script.remove());
+        const sources = scripts.map((script) => script.getAttribute('src')).filter(isRelative);
+
+        // Replace the frame's empty <html>, left by EMPTY_COOL_PAGE_SCRIPT, with CODA's <html>.
+        document.documentElement.replaceWith(document.adoptNode(app.documentElement));
+
+        // The load event fired when the page was emptied, and CODA's start waits for it.
+        const loaded = () => window.dispatchEvent(new Event('load'));
+
+        // Add CODA's scripts again, from config.base. With async off, they load in parallel and
+        // run in order.
+        sources.forEach((source, index) => {
+            const script = document.createElement('script');
+            script.src = config.base + source;
+            script.async = false;
+            if (index === sources.length - 1)
+                script.addEventListener('load', loaded);
+
+            document.head.append(script);
+        });
+    }).catch((error) => console.error('CODA could not put its editor page in: ' + error.message));
+}
+)JS";
+
+// The injected script puts this path in front of the relative paths in CODA's page, so
+// "global.js" becomes "/coollocal/bundled/global.js" on the COOL server's origin. CODA answers the
+// requests under this path with the local files.
+constexpr std::string_view COOLLOCAL_BUNDLED_PATH = "/coollocal/bundled/";
+
+static std::wstring bundledContentType(const std::string& name)
+{
+    // The kinds of file in CODA's browser folder. The Windows registry often has
+    // no content type for .js, and a script without one does not run.
+    static const std::map<std::string, std::wstring> contentTypes = {
+        { "html", L"text/html; charset=utf-8" },
+        { "css", L"text/css" },
+        { "js", L"text/javascript" },
+        { "json", L"application/json" },
+        { "svg", L"image/svg+xml" },
+        { "png", L"image/png" },
+        { "gif", L"image/gif" },
+        { "ttf", L"font/ttf" },
+    };
+
+    const auto known = contentTypes.find(Poco::Path(name).getExtension());
+    if (known == contentTypes.end())
+        return L"application/octet-stream";
+    return known->second;
+}
+
+// A web address (http or https) with a host, which Poco::URI can parse.
+static bool isValidURI(const std::string& address)
+{
+    try
+    {
+        const Poco::URI uri(address);
+        return (uri.getScheme() == "https" || uri.getScheme() == "http") &&
+               !uri.getHost().empty();
+    }
+    catch (const Poco::SyntaxException&)
+    {
+        return false;
+    }
+}
+
+// The port is always written, so two addresses of one origin give the same text.
+static std::string originOf(const Poco::URI& uri)
+{
+    return uri.getScheme() + "://" + Util::toLower(uri.getHost()) + ':' +
+           std::to_string(uri.getPort());
+}
+
+static std::string originOf(const wchar_t* address)
+{
+    try
+    {
+        return originOf(Poco::URI(Util::wide_string_to_string(address)));
+    }
+    catch (const Poco::SyntaxException&)
+    {
+        return std::string();
+    }
+}
+
+static std::string posterOf(ICoreWebView2WebResourceRequest* request)
+{
+    wil::com_ptr<ICoreWebView2HttpRequestHeaders> headers;
+    wil::unique_cotaskmem_string poster;
+    request->get_Headers(&headers);
+
+    if (!headers || FAILED(headers->GetHeader(L"Origin", &poster)))
+    {
+        LOG_DBG("The form has no Origin header");
+        return std::string();
+    }
+
+    if (std::wstring_view(poster.get()) == L"null")
+    {
+        LOG_DBG("The form's Origin header is null");
+        return std::string();
+    }
+
+    return originOf(poster.get());
+}
+
+// The integrator opens a document by posting a form with the token and settings into the iframe
+// that holds the editor. We save that form because we don't want the cool.html from the remote
+// coolwsd to load. Later we would inject a script with this form which can repost this from
+// the javascript world and get the cool.html and scrape the settings out of it.
+static void keepEditorForm(DocumentTab& account, ICoreWebView2WebResourceRequest* request,
+                           const std::string& url)
+{
+    wil::com_ptr<IStream> body;
+    if (FAILED(request->get_Content(&body)) || !body)
+    {
+        LOG_WRN("No form was kept: the form posted into an editor frame has no body");
+        return;
+    }
+
+    std::string form;
+    char chunk[FORM_CHUNK_BYTES];
+    while (form.size() <= MAX_FORM_BYTES)
+    {
+        ULONG read = 0;
+        const HRESULT readResult = body->Read(chunk, sizeof(chunk), &read);
+        if (FAILED(readResult) || read == 0)
+            break;
+        form.append(chunk, read);
+    }
+
+    // The request reads the form from the start when it goes on to coolwsd.
+    const LARGE_INTEGER start{};
+    body->Seek(start, STREAM_SEEK_SET, nullptr);
+
+    if (form.size() > MAX_FORM_BYTES)
+    {
+        LOG_WRN("No form was kept: the form posted into an editor frame is at least "
+                << form.size() << " bytes, over the limit of " << MAX_FORM_BYTES << " bytes");
+        return;
+    }
+
+    account.editorForm = std::move(form);
+    account.editorFormUrl = url;
+    account.isEditorFormPosterKnown = !posterOf(request).empty();
+    LOG_DBG("Kept the " << account.editorForm.size() << "-byte form posted into an editor frame");
+}
+
+// The path of a file in CODA's browser folder, or an empty string when the segments lead out of it.
+// TODO: Qt and macOS check their bundled files by the same rules. Move this to common/.
+static std::string bundledFilePath(const std::vector<std::string>& segments)
+{
+    if (segments.empty())
+        return std::string();
+
+    std::string path = app_installation_path + "..\\cool";
+    for (const std::string& segment : segments)
+    {
+        const bool isHidden = segment.starts_with('.');
+        const bool hasSeparator = segment.find_first_of("\\:") != std::string::npos;
+        if (segment.empty() || isHidden || hasSeparator)
+            return std::string();
+
+        path += '\\' + segment;
+    }
+
+    return path;
+}
+
+// "/coollocal/bundled/global.js" gets global.js from CODA's browser folder.
+static void serveBundledFile(const DocumentTab& account,
+                             ICoreWebView2WebResourceRequestedEventArgs* args, const Poco::URI& uri)
+{
+    if (!account.editorOrigins.contains(originOf(uri)))
+    {
+        LOG_DBG("A request for a bundled file goes on unanswered: no editor form was posted to "
+                "its origin");
+        return;
+    }
+
+    // The path starts with the segments of COOLLOCAL_BUNDLED_PATH, "coollocal" and "bundled".
+    std::vector<std::string> segments;
+    uri.getPathSegments(segments);
+    segments.erase(segments.begin(), segments.begin() + 2);
+
+    const std::string path = bundledFilePath(segments);
+    if (path.empty())
+    {
+        LOG_WRN("A request for a bundled file was refused: it leads out of the folder");
+        respondWithoutBody(webViewEnvironment.get(), args, 404, L"Not Found", L"");
+        return;
+    }
+
+    wil::com_ptr<IStream> file;
+    HRESULT hr = SHCreateStreamOnFileEx(Util::string_to_wide_string(path).c_str(),
+                                        STGM_READ | STGM_SHARE_DENY_NONE, FILE_ATTRIBUTE_NORMAL,
+                                        FALSE, nullptr, &file);
+    if (FAILED(hr))
+    {
+        const std::string name = uri.getPath().substr(COOLLOCAL_BUNDLED_PATH.size());
+        LOG_DBG("'" << name << "' was not found in CODA's bundled folder");
+        respondWithoutBody(webViewEnvironment.get(), args, 404, L"Not Found", L"");
+        return;
+    }
+
+    // no-store keeps the files out of the memory cache, which WebResourceRequested never sees.
+    const std::wstring headers = L"Content-Type: " + bundledContentType(segments.back()) +
+                                 L"\r\nCache-Control: no-store\r\n";
+    wil::com_ptr<ICoreWebView2WebResourceResponse> response;
+    hr = webViewEnvironment->CreateWebResourceResponse(file.get(), 200, L"OK", headers.c_str(),
+                                                       &response);
+    if (FAILED(hr))
+    {
+        LOG_ERR("CreateWebResourceResponse() failed");
+        return;
+    }
+
+    args->put_Response(response.get());
+}
+
+// We keep an editor form only while the window shows the account address the
+// user entered in the backstage view, and only when a page on that address
+// posted it. When the browser does not say who posted it, we check that the
+// frame it goes into is a fresh one: see putCodaPageIn.
+static bool isPostedByIntegrator(const DocumentTab& account,
+                                 ICoreWebView2WebResourceRequest* request)
+{
+    wil::unique_cotaskmem_string mainAddress;
+    account.webView->get_Source(&mainAddress);
+    if (originOf(mainAddress.get()) != account.accountOrigin)
+    {
+        LOG_WRN("No form was kept: the account window does not show the integrator's page");
+        return false;
+    }
+
+    const std::string poster = posterOf(request);
+    if (!poster.empty() && poster != account.accountOrigin)
+    {
+        LOG_WRN("No form was kept: a page other than the integrator's posted it");
+        return false;
+    }
+
+    return true;
+}
+
+// WebView2 calls this for every request that matches one of the account window's filters.
+static void handleAccountRequest(int accountTabId, ICoreWebView2WebResourceRequestedEventArgs* args)
+{
+    DocumentTab* account = findTab(accountTabId);
+    if (!account)
+    {
+        LOG_DBG("A request of a closed account window goes on as it is");
+        return;
+    }
+
+    wil::com_ptr<ICoreWebView2WebResourceRequest> request;
+    wil::unique_cotaskmem_string address;
+    wil::unique_cotaskmem_string method;
+    COREWEBVIEW2_WEB_RESOURCE_CONTEXT context;
+    args->get_Request(&request);
+    request->get_Uri(&address);
+    request->get_Method(&method);
+    args->get_ResourceContext(&context);
+
+    const std::string url = Util::wide_string_to_string(address.get());
+    const Poco::URI uri(url);
+    const bool isPost = std::wstring_view(method.get()) == L"POST";
+    const bool isGet = std::wstring_view(method.get()) == L"GET";
+    const bool isDocument = context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT;
+    const bool isEditorPage = uri.getPath().ends_with("/cool.html");
+    const bool isBundledFile = uri.getPath().starts_with(COOLLOCAL_BUNDLED_PATH);
+
+    if (isDocument && isEditorPage && isPost)
+    {
+        if (!isPostedByIntegrator(*account, request.get()))
+            return;
+
+        keepEditorForm(*account, request.get(), url);
+    }
+    else if (isBundledFile && isGet)
+    {
+        serveBundledFile(*account, args, uri);
+    }
+}
+
+static UINT32 frameIdOf(ICoreWebView2Frame* frame)
+{
+    // Only the newer ICoreWebView2Frame5 interface of a frame has its id.
+    const auto frameWithId = wil::try_com_query<ICoreWebView2Frame5>(frame);
+    if (!frameWithId)
+        return 0;
+
+    UINT32 id = 0;
+    frameWithId->get_FrameId(&id);
+    return id;
+}
+
+static bool isEditorFrame(const DocumentTab& account, ICoreWebView2Frame* frame)
+{
+    if (!account.editorFrame)
+        return false;
+
+    const UINT32 id = frameIdOf(frame);
+    return id != 0 && id == frameIdOf(account.editorFrame.get());
+}
+
+// What CODA's editor page may ask native code for. A refused call still gets an
+// empty reply, because the page code that made it waits for one.
+static bool isAllowedFromEditorPage(const DocumentTab& account, const std::wstring& message)
+{
+    const std::string text = Util::wide_string_to_string(message);
+    if (text.starts_with("ERR ") || text.starts_with("DBG "))
+        return true;
+
+    if (text.starts_with("MSG "))
+        return EditorFrameMessages::isAllowed(text.substr(4));
+
+    // "CALL <id> <name> <arguments>"
+    const StringVector tokens = StringVector::tokenize(text);
+    const bool isCall = tokens.size() > 2 && tokens.equals(0, "CALL");
+    if (!isCall)
+    {
+        LOG_WRN("A message from the editor frame was refused: it is not MSG, CALL, ERR or DBG: "
+                << text);
+        return false;
+    }
+
+    if (EditorFrameMessages::isAllowedCall(tokens[2]))
+        return true;
+
+    const int id = std::atoi(tokens[1].c_str());
+    postReplyToCall(account.hWnd, account.tabId, id, std::string());
+    return false;
+}
+
+static void handleEditorFrameMessage(int accountTabId, ICoreWebView2Frame* sender,
+                                     ICoreWebView2WebMessageReceivedEventArgs* args)
+{
+    DocumentTab* account = findTab(accountTabId);
+    if (!account)
+    {
+        LOG_DBG("A message from an editor frame arrived after its account window closed");
+        return;
+    }
+
+    if (!isEditorFrame(*account, sender))
+    {
+        LOG_WRN("A message was refused: it came from a frame without CODA's editor page");
+        return;
+    }
+
+    wil::unique_cotaskmem_string source;
+    args->get_Source(&source);
+    const Poco::URI sourceUri(Util::wide_string_to_string(source.get()));
+    if (!account->editorOrigins.contains(originOf(sourceUri)))
+    {
+        LOG_WRN("A message from the editor frame was refused: its page is not on a COOL server");
+        return;
+    }
+
+    wil::unique_cotaskmem_string message;
+    if (FAILED(args->TryGetWebMessageAsString(&message)))
+    {
+        LOG_WRN("A message from the editor frame was refused: it is not text");
+        return;
+    }
+
+    if (!isAllowedFromEditorPage(*account, message.get()))
+        return;
+
+    processMessage(*account, message);
+}
+
+static void putCodaPageIn(int accountTabId, ICoreWebView2Frame* frame, const std::string& address,
+                          bool isFreshFrame)
+{
+    DocumentTab* account = findTab(accountTabId);
+    if (!account)
+    {
+        LOG_DBG("A frame loaded after its account window closed");
+        return;
+    }
+
+    if (account->editorForm.empty() || address != account->editorFormUrl)
+        return;
+
+    // Only the page that made a frame can post into it while it is still blank. A page that goes
+    // blank later keeps its own origin. Only the main frame's direct children are watched (see
+    // FrameCreated), so a frame nested in another iframe never gets here.
+    if (!account->isEditorFormPosterKnown && !isFreshFrame)
+    {
+        LOG_WRN("The form was not used: another site's page posted it");
+        return;
+    }
+
+    account->editorOrigins.insert(originOf(Poco::URI(account->editorFormUrl)));
+
+    wil::com_ptr<ICoreWebView2Frame2> frame2;
+    if (FAILED(frame->QueryInterface(IID_PPV_ARGS(&frame2))))
+    {
+        LOG_ERR("The editor frame cannot run a script");
+        return;
+    }
+
+    account->editorFrame = frame2;
+
+    Poco::JSON::Object::Ptr config = new Poco::JSON::Object();
+    config->set("formUrl", account->editorFormUrl);
+    config->set("formBody", account->editorForm);
+    config->set("base", std::string(COOLLOCAL_BUNDLED_PATH));
+    const std::string script =
+        std::string("(") + PUT_CODA_PAGE_IN_SCRIPT + ")(" + JsonUtil::jsonToString(config) + ")";
+
+    frame2->ExecuteScript(Util::string_to_wide_string(script).c_str(), nullptr);
+    LOG_DBG("Putting CODA's editor page into the editor frame");
+}
+
+// Engine output and replies go to editorFrame, so it is forgotten once the
+// iframe loads another page or goes away.
+static void forgetEditorFrame(int accountTabId, ICoreWebView2Frame* frame)
+{
+    DocumentTab* account = findTab(accountTabId);
+    if (!account)
+        return;
+    if (!isEditorFrame(*account, frame))
+        return;
+
+    LOG_DBG("The editor frame left CODA's editor page");
+    account->editorFrame = nullptr;
+}
+
+// WebView2 does not say which frame a request is for. So each frame reports where it navigates,
+// and gets CODA's page once it has loaded the address the kept form was posted to.
+static void watchAccountFrame(int accountTabId, ICoreWebView2Frame* created)
+{
+    wil::com_ptr<ICoreWebView2Frame2> frame;
+    if (FAILED(created->QueryInterface(IID_PPV_ARGS(&frame))))
+    {
+        LOG_ERR("A frame of an account window has no navigation events");
+        return;
+    }
+
+    auto address = std::make_shared<std::string>();
+    auto isFreshFrame = std::make_shared<bool>(true);
+    EventRegistrationToken token;
+    frame->add_NavigationStarting(
+        Microsoft::WRL::Callback<ICoreWebView2FrameNavigationStartingEventHandler>(
+            [accountTabId, address](ICoreWebView2Frame* sender,
+                                    ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT
+            {
+                wil::unique_cotaskmem_string uri;
+                args->get_Uri(&uri);
+                *address = Util::wide_string_to_string(uri.get());
+                forgetEditorFrame(accountTabId, sender);
+                return S_OK;
+            })
+            .Get(),
+        &token);
+
+    frame->add_NavigationCompleted(
+        Microsoft::WRL::Callback<ICoreWebView2FrameNavigationCompletedEventHandler>(
+            [accountTabId, address, isFreshFrame](
+                ICoreWebView2Frame* sender, ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT
+            {
+                putCodaPageIn(accountTabId, sender, *address, *isFreshFrame);
+                // A frame is fresh until it loads something other than about:blank.
+                if (*address != "about:blank")
+                    *isFreshFrame = false;
+                return S_OK;
+            })
+            .Get(),
+        &token);
+
+    frame->add_Destroyed(
+        Microsoft::WRL::Callback<ICoreWebView2FrameDestroyedEventHandler>(
+            [accountTabId](ICoreWebView2Frame* sender, IUnknown*) -> HRESULT
+            {
+                forgetEditorFrame(accountTabId, sender);
+                return S_OK;
+            })
+            .Get(),
+        &token);
+
+    frame->add_WebMessageReceived(
+        Microsoft::WRL::Callback<ICoreWebView2FrameWebMessageReceivedEventHandler>(
+            [accountTabId](ICoreWebView2Frame* sender,
+                           ICoreWebView2WebMessageReceivedEventArgs* args) -> HRESULT
+            {
+                handleEditorFrameMessage(accountTabId, sender, args);
+                return S_OK;
+            })
+            .Get(),
+        &token);
+}
+
+// Other schemes would start other apps, so only web addresses go to the system browser.
+static void openInSystemBrowser(HWND hWnd, const std::wstring& address)
+{
+    const std::string lowerAddress = Util::toLower(Util::wide_string_to_string(address));
+    const bool isWebAddress =
+        lowerAddress.starts_with("https://") || lowerAddress.starts_with("http://");
+    if (!isWebAddress)
+    {
+        LOG_WRN("A link from an account window was not opened: it is not a web address");
+        return;
+    }
+
+    ShellExecuteW(hWnd, nullptr, address.c_str(), nullptr, nullptr, SW_SHOW);
+}
+
+// TODO: A sign-in through another site, such as an identity provider, is refused too.
+static void keepOnIntegratorSite(int accountTabId, ICoreWebView2NavigationStartingEventArgs* args)
+{
+    DocumentTab* account = findTab(accountTabId);
+    if (!account)
+        return;
+
+    wil::unique_cotaskmem_string address;
+    args->get_Uri(&address);
+    if (originOf(address.get()) == account->accountOrigin)
+        return;
+
+    args->put_Cancel(TRUE);
+
+    BOOL isUserInitiated = FALSE;
+    BOOL isRedirected = FALSE;
+    args->get_IsUserInitiated(&isUserInitiated);
+    args->get_IsRedirected(&isRedirected);
+
+    if (!isUserInitiated || isRedirected)
+    {
+        LOG_WRN("The account window was kept from leaving the integrator's site");
+        return;
+    }
+
+    LOG_INF("Opening a link from an account window in the system browser");
+    openInSystemBrowser(account->hWnd, address.get());
+}
+
+// No window opens; the address goes to the system browser instead.
+static void openNewWindowInBrowser(int accountTabId, ICoreWebView2NewWindowRequestedEventArgs* args)
+{
+    args->put_Handled(TRUE);
+
+    DocumentTab* account = findTab(accountTabId);
+    if (!account)
+        return;
+
+    wil::unique_cotaskmem_string address;
+    args->get_Uri(&address);
+    LOG_INF("Opening a new window of an account window in the system browser");
+    openInSystemBrowser(account->hWnd, address.get());
+}
+
+static void openAccountWindow(const std::string& url)
+{
+    if (!isValidURI(url))
+    {
+        LOG_WRN("Can't open a window, invalid address: " << url);
+        return;
+    }
+
+    int width, height;
+    defaultWindowSize(width, height);
+    WindowState& window = createAppWindow(Util::string_to_wide_string(APP_NAME),
+                                          WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                                          width, height);
+    DocumentTab& account = createTab(window, {}, DocumentMode::CLOUD_ACCOUNT);
+    account.hasContent = true;
+    account.accountOrigin = originOf(Poco::URI(url));
+    activateTab(window, account.tabId);
+
+    const int accountTabId = account.tabId;
+    withWebView2Environment(
+        [accountTabId, url](ICoreWebView2Environment* env)
+        {
+            DocumentTab* tab = findTab(accountTabId);
+            if (!tab)
+            {
+                LOG_DBG("The account window closed before its web view was made");
+                return;
+            }
+
+            env->CreateCoreWebView2Controller(
+                tab->hWnd,
+                Microsoft::WRL::Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                    [accountTabId, url](HRESULT, ICoreWebView2Controller* controller) -> HRESULT
+                    {
+                        DocumentTab* account = findTab(accountTabId);
+                        WindowState* window = account ? findWindow(account->hWnd) : nullptr;
+                        if (!controller || !window)
+                        {
+                            LOG_WRN("The account window got no web view");
+                            return E_FAIL;
+                        }
+
+                        account->webViewController = controller;
+                        controller->get_CoreWebView2(account->webView.put());
+                        controller->put_Bounds(documentArea(*window));
+                        controller->put_IsVisible(TRUE);
+
+                        auto webView22 = account->webView.try_query<ICoreWebView2_22>();
+                        if (!webView22)
+                        {
+                            LOG_ERR("The account window's web view cannot filter requests");
+                            return E_FAIL;
+                        }
+
+                        webView22->AddWebResourceRequestedFilterWithRequestSourceKinds(
+                            L"*/cool.html*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT,
+                            COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL);
+                        webView22->AddWebResourceRequestedFilterWithRequestSourceKinds(
+                            L"*/coollocal/bundled/*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                            COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL);
+
+                        EventRegistrationToken token;
+                        account->webView->add_WebResourceRequested(
+                            Microsoft::WRL::Callback<ICoreWebView2WebResourceRequestedEventHandler>(
+                                [accountTabId](ICoreWebView2*,
+                                               ICoreWebView2WebResourceRequestedEventArgs* args)
+                                    -> HRESULT
+                                {
+                                    handleAccountRequest(accountTabId, args);
+                                    return S_OK;
+                                })
+                                .Get(),
+                            &token);
+
+                        // The main frame loads a page: a link click, a form post or a redirect.
+                        account->webView->add_NavigationStarting(
+                            Microsoft::WRL::Callback<ICoreWebView2NavigationStartingEventHandler>(
+                                [accountTabId](ICoreWebView2*,
+                                               ICoreWebView2NavigationStartingEventArgs* args)
+                                    -> HRESULT
+                                {
+                                    keepOnIntegratorSite(accountTabId, args);
+                                    return S_OK;
+                                })
+                                .Get(),
+                            &token);
+
+                        // Any frame asks for another window: window.open or a target=_blank link.
+                        account->webView->add_NewWindowRequested(
+                            Microsoft::WRL::Callback<ICoreWebView2NewWindowRequestedEventHandler>(
+                                [accountTabId](ICoreWebView2*,
+                                               ICoreWebView2NewWindowRequestedEventArgs* args)
+                                    -> HRESULT
+                                {
+                                    openNewWindowInBrowser(accountTabId, args);
+                                    return S_OK;
+                                })
+                                .Get(),
+                            &token);
+
+                        webView22->add_FrameCreated(
+                            Microsoft::WRL::Callback<ICoreWebView2FrameCreatedEventHandler>(
+                                [accountTabId](ICoreWebView2*,
+                                               ICoreWebView2FrameCreatedEventArgs* args) -> HRESULT
+                                {
+                                    wil::com_ptr<ICoreWebView2Frame> frame;
+                                    args->get_Frame(&frame);
+                                    watchAccountFrame(accountTabId, frame.get());
+                                    return S_OK;
+                                })
+                                .Get(),
+                            &token);
+
+                        account->webView->AddScriptToExecuteOnDocumentCreated(
+                            Util::string_to_wide_string(EMPTY_COOL_PAGE_SCRIPT).c_str(),
+                            Microsoft::WRL::Callback<
+                                ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
+                                [](HRESULT result, LPCWSTR) -> HRESULT
+                                {
+                                    if (FAILED(result))
+                                        LOG_ERR("The script that empties coolwsd's page is not in");
+                                    return S_OK;
+                                })
+                                .Get());
+
+                        account->webView->Navigate(Util::string_to_wide_string(url).c_str());
+                        return S_OK;
+                    })
+                    .Get());
+        });
+}
+
+namespace
+{
+// Result of a WinHTTP request: an HTTP status code (>= 100), or one of the
+// ai:: sentinels (HttpNoResponse / HttpConnectFailed) when no response arrived.
+struct HttpResult
+{
+    int statusCode;
+    std::string body;
+};
+
+// Perform a blocking HTTP request with WinHTTP. The desktop app has no COOL net
+// stack for outbound requests, so the AI proxy and the Options dialog's model
+// listing reach providers through this. \c authHeader, when non-empty, becomes
+// the Authorization header value (e.g. "Bearer <key>").
+HttpResult winHttpRequest(const wchar_t* verb, const std::string& url,
+                          const std::string& authHeader, const std::string& body,
+                          int timeoutSeconds)
+{
+    HttpResult result{ ai::HttpConnectFailed, std::string() };
+
+    const std::wstring wideUrl = Util::string_to_wide_string(url);
+    URL_COMPONENTS components;
+    ZeroMemory(&components, sizeof(components));
+    components.dwStructSize = sizeof(components);
+    wchar_t hostName[256] = {};
+    wchar_t urlPath[8192] = {};
+    components.lpszHostName = hostName;
+    components.dwHostNameLength = ARRAYSIZE(hostName);
+    components.lpszUrlPath = urlPath;
+    components.dwUrlPathLength = ARRAYSIZE(urlPath);
+    if (!WinHttpCrackUrl(wideUrl.c_str(), 0, 0, &components))
+        return result;
+
+    HINTERNET session = WinHttpOpen(L"CODA", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (session == nullptr)
+        return result;
+
+    if (timeoutSeconds > 0)
+    {
+        const int ms = timeoutSeconds * 1000;
+        WinHttpSetTimeouts(session, ms, ms, ms, ms);
+    }
+
+    HINTERNET connection = WinHttpConnect(session, hostName, components.nPort, 0);
+    if (connection == nullptr)
+    {
+        WinHttpCloseHandle(session);
+        return result;
+    }
+
+    const DWORD flags = (components.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET request = WinHttpOpenRequest(connection, verb, urlPath, nullptr, WINHTTP_NO_REFERER,
+                                           WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (request == nullptr)
+    {
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        return result;
+    }
+
+    std::wstring headers = L"Content-Type: application/json\r\n";
+    if (!authHeader.empty())
+        headers += L"Authorization: " + Util::string_to_wide_string(authHeader) + L"\r\n";
+    WinHttpAddRequestHeaders(request, headers.c_str(), static_cast<DWORD>(-1),
+                             WINHTTP_ADDREQ_FLAG_ADD);
+
+    BOOL ok = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                 body.empty() ? WINHTTP_NO_REQUEST_DATA
+                                              : const_cast<char*>(body.data()),
+                                 static_cast<DWORD>(body.size()),
+                                 static_cast<DWORD>(body.size()), 0);
+    if (ok)
+        ok = WinHttpReceiveResponse(request, nullptr);
+
+    if (!ok)
+    {
+        result.statusCode =
+            (GetLastError() == ERROR_WINHTTP_TIMEOUT) ? ai::HttpNoResponse : ai::HttpConnectFailed;
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        return result;
+    }
+
+    DWORD statusCode = 0;
+    DWORD statusLen = sizeof(statusCode);
+    WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusLen,
+                        WINHTTP_NO_HEADER_INDEX);
+    result.statusCode = static_cast<int>(statusCode);
+
+    DWORD available = 0;
+    do
+    {
+        available = 0;
+        if (!WinHttpQueryDataAvailable(request, &available) || available == 0)
+            break;
+        std::string chunk(available, '\0');
+        DWORD read = 0;
+        if (!WinHttpReadData(request, &chunk[0], available, &read))
+            break;
+        chunk.resize(read);
+        result.body += chunk;
+    } while (available > 0);
+
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connection);
+    WinHttpCloseHandle(session);
+    return result;
+}
+
+// Register the AI chat HTTP transport. AIChatSession reaches the provider
+// through this platform hook (the Windows counterpart of Qt's
+// registerAIHttpTransport()). onDone may run on any thread; AIChatSession hops
+// back onto its polling thread itself.
+void registerAIHttpTransport()
+{
+    ai::setHttpPostFn(
+        [](const std::string& url, const std::string& authHeader, std::string body,
+           int timeoutSeconds, ai::HttpDoneCallback onDone)
+        {
+            // Called on the document's polling thread; run the blocking WinHTTP
+            // request on its own thread so we don't stall that thread.
+            std::thread(
+                [url, authHeader, body = std::move(body), timeoutSeconds,
+                 onDone = std::move(onDone)]() mutable
+                {
+                    ProcUtil::setThreadName("aihttp");
+                    const HttpResult result =
+                        winHttpRequest(L"POST", url, authHeader, body, timeoutSeconds);
+                    onDone(result.statusCode, std::move(result.body));
+                })
+                .detach();
+        });
+}
+
+// Fetch an AI provider's model list for the Options dialog. The desktop apps
+// have no server-side proxy, so the app issues the request itself, mirroring
+// Qt's Desktop::fetchAIModels(). The payload is {"provider","apiKey","baseUrl"};
+// returns the provider's JSON body verbatim ({"data":[...]} or its own error
+// JSON), or an {"error":...} JSON of our own.
+std::string fetchAIModels(const std::string& payload)
+{
+    Poco::JSON::Object::Ptr obj;
+    if (!JsonUtil::parseJSON(payload, obj))
+        return R"({"error":"Invalid payload"})";
+
+    std::string provider, apiKey, baseUrl;
+    JsonUtil::findJSONValue(obj, "provider", provider);
+    JsonUtil::findJSONValue(obj, "apiKey", apiKey);
+    JsonUtil::findJSONValue(obj, "baseUrl", baseUrl);
+
+    if (provider.empty() || apiKey.empty())
+        return R"({"error":"Missing provider or apiKey"})";
+
+    if (provider != "custom")
+    {
+        // Keep in sync with preCannedAIProviderBaseUrl() in wsd/FileServer.cpp
+        // and the same map in qt/Application.cpp / macos COWrapper.mm.
+        static const std::map<std::string, std::string> preCanned = {
+            { "openai", "https://api.openai.com" },
+            { "groq", "https://api.groq.com/openai" },
+            { "together", "https://api.together.xyz" },
+            { "mistral", "https://api.mistral.ai" },
+        };
+        const auto it = preCanned.find(provider);
+        if (it == preCanned.end())
+            return R"({"error":"Unknown provider"})";
+        baseUrl = it->second;
+    }
+    else if (baseUrl.empty())
+    {
+        return R"({"error":"Missing baseUrl for custom provider"})";
+    }
+
+    if (!baseUrl.empty() && baseUrl.back() == '/')
+        baseUrl.pop_back();
+    baseUrl += "/v1/models";
+
+    const HttpResult result = winHttpRequest(L"GET", baseUrl, "Bearer " + apiKey, std::string(), 30);
+    if (result.statusCode < 100 && result.body.empty())
+        return R"({"error":"Failed to reach the AI provider"})";
+    return result.body;
+}
+} // namespace
+
+static HANDLE copyEngineClipboardData(UINT format, const std::string& mimeType)
+{
+    // The clipboard is process-global (one shared clipboard for the desktop app), so read it
+    // straight from the engine; no document is involved.
+    std::vector<char> bytes;
+    if (!office || !office->getGlobalClipboardData(mimeType.c_str(), bytes))
+        return 0;
+
+    HGLOBAL hMem;
+    const void *src;
+    size_t size;
+    std::wstring wtemp;
+    std::string temp;
+    if (format == CF_UNICODETEXT && mimeType == "text/plain;charset=utf-8")
+    {
+        wtemp = Util::string_to_wide_string(std::string_view(bytes.data(), bytes.size()));
+        src = wtemp.c_str();
+        size = (wtemp.length() + 1) * 2;
+    }
+    else if (format == RegisterClipboardFormatW(L"HTML Format") && mimeType == "text/html")
+    {
+        temp = generate_html_format(std::string(bytes.data(), bytes.size()));
+        src = temp.c_str();
+        size = temp.length();
+    }
+    else
+    {
+        src = bytes.data();
+        size = bytes.size();
+    }
+    hMem = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (hMem == NULL)
+    {
+        return 0;
+    }
+    void* dest = GlobalLock(hMem);
+    if (dest == nullptr)
+    {
+        GlobalFree(hMem);
+        return 0;
+    }
+    std::memcpy(dest, src, size);
+    GlobalUnlock(hMem);
+
+    return hMem;
+}
+
+static std::string MIME_type_for_clipboard_format(UINT format)
+{
+    if (format == CF_UNICODETEXT)
+        return "text/plain;charset=utf-8";
+    if (format == CF_HDROP)
+        return "text/uri-list";
+
+    auto name = get_clipboard_format_name(format);
+
+    if (name == L"text/markdown" ||
+        name == L"text/rtf" ||
+        name == L"image/png" ||
+        name == L"image/svg+xml")
+        // Clipboard format names that are directly MIME types
+        return Util::wide_string_to_string(name);
+    else if (name == L"Markdown")
+        return "text/markdown";
+    else if (name == L"Star Embed Source (XML)")
+        return "application/x-openoffice-embed-source-xml;windows_formatname=\"Star Embed Source (XML)\"";
+    else if (name == L"Star Object Descriptor (XML)")
+        return "application/x-openoffice-objectdescriptor-xml;windows_formatname=\"Star Object Descriptor (XML)\"";
+    else if (name == L"PNG")
+        return "image/png";
+    else if (name == L"Rich Text Format")
+        return "text/rtf";
+    else if (name == L"HTML Format")
+        return "text/html";
+    else if (name == L"FileNameW")
+        return "text/uri-list";
+
+    return "";
+}
+
+static std::vector<int> clipboard_formats_for_MIME_type(const char* mimeType)
+{
+    std::vector<int> result;
+
+    if (std::strcmp(mimeType, "text/plain;charset=utf-8") == 0)
+        result.push_back(CF_UNICODETEXT);
+    else if (std::strcmp(mimeType, "text/rtf") == 0)
+        result.push_back(RegisterClipboardFormatW(L"Rich Text Format"));
+    else if (std::strcmp(mimeType, "text/html") == 0)
+        result.push_back(RegisterClipboardFormatW(L"HTML Format"));
+    else if (std::strcmp(mimeType, "text/markdown") == 0)
+    {
+        result.push_back(RegisterClipboardFormatW(L"text/markdown"));
+        result.push_back(RegisterClipboardFormatW(L"Markdown"));
+    }
+    else if (std::strcmp(mimeType, "image/png") == 0)
+    {
+        result.push_back(RegisterClipboardFormatW(L"image/png"));
+        result.push_back(RegisterClipboardFormatW(L"PNG"));
+    }
+    else if (std::strcmp(mimeType, "application/x-openoffice-embed-source-xml;windows_formatname=\"Star Embed Source (XML)\"") == 0)
+        result.push_back(RegisterClipboardFormatW(L"Star Embed Source (XML)"));
+    else if (std::string(mimeType).starts_with("application/x-openoffice-objectdescriptor-xml;"))
+        result.push_back(RegisterClipboardFormatW(L"Star Object Descriptor (XML)"));
+    else if (std::strcmp(mimeType, "image/svg+xml;windows_formatname=\"image/svg+xml\"") == 0)
+        result.push_back(RegisterClipboardFormatW(L"image/svg+xml"));
+
+    return result;
+}
+
+/**
+ * The clipboard provider the engine drives. On copy the engine advertises its formats through
+ * advertise; on an external paste it reads the clipboard one format at a time. The callbacks
+ * act on the process, not one window, so the one shared clipboard is reached from whichever
+ * document is current.
+ */
+
+static void clipboardProviderAdvertise(const char** pMimeTypes)
+{
+    // Delayed rendering needs a live window to own the clipboard and receive WM_RENDERFORMAT. Use
+    // the hidden owner window, which lives for the whole app run. The clipboard is only rendered in
+    // full (WM_RENDERALLFORMATS) when the app exits, not when an individual document window closes.
+    if (!hiddenOwnerWindow)
+        return;
+
+    if (!try_open_clipboard(hiddenOwnerWindow))
+        return;
+
+    if (!EmptyClipboard())
+    {
+        CloseClipboard();
+        return;
+    }
+
+    bool didSetData = false;
+
+    for (size_t i = 0; pMimeTypes && pMimeTypes[i]; ++i)
+    {
+        auto formats = clipboard_formats_for_MIME_type(pMimeTypes[i]);
+        if (formats.size() != 0)
+        {
+            for (auto const &format : formats)
+                SetClipboardData(format, NULL);
+            didSetData = true;
+        }
+    }
+
+    if (didSetData)
+        weOwnTheClipboard = true;
+
+    CloseClipboard();
+}
+
+static bool clipboardProviderOwns()
+{
+    return weOwnTheClipboard;
+}
+
+static std::vector<std::string> clipboardProviderGetMimeTypes()
+{
+    // Reading needs no owner window, so open the clipboard for the current "task".
+    //
+    // (Task is an 16-bit Windows term still used in documentation for the clipboard API that is
+    // basically unchanged since then. In current Windows, it means thread, more or less.)
+    if (!try_open_clipboard(NULL))
+        return {};
+
+    UINT format = 0;
+
+    std::vector<std::string> mimeTypes;
+    std::set<std::string> doneMimeTypes;
+
+    while ((format = EnumClipboardFormats(format)) != 0)
+    {
+        if (format == CF_UNICODETEXT)
+        {
+            mimeTypes.push_back("text/plain;charset=utf-8");
+            doneMimeTypes.insert("text/plain;charset=utf-8");
+        }
+        else
+        {
+            auto mimeType = MIME_type_for_clipboard_format(format);
+
+            if (mimeType != "" && doneMimeTypes.count(mimeType) == 0)
+            {
+                doneMimeTypes.insert(mimeType);
+                mimeTypes.push_back(mimeType);
+            }
+        }
+    }
+
+    CloseClipboard();
+
+    return mimeTypes;
+}
+
+// When the user copies files in Explorer, the clipboard holds the files as a CF_HDROP file list. It
+// also holds the FileNameW format, which is the pathname of the first file only, in UTF-16 and
+// followed by a null. The text/uri-list made from them holds the file: URI of each file, each
+// followed by CRLF.
+static bool getClipboardFilesAsUriList(std::vector<char>* pOutData)
+{
+    if (!try_open_clipboard(NULL))
+        return false;
+
+    std::vector<std::wstring> paths;
+    if (HANDLE handle = GetClipboardData(CF_HDROP))
+        paths = pathsInFileList(static_cast<HDROP>(handle));
+
+    if (paths.empty())
+    {
+        if (HANDLE handle = GetClipboardData(RegisterClipboardFormatW(L"FileNameW")))
+        {
+            if (const wchar_t* wpath = (const wchar_t*)GlobalLock(handle))
+            {
+                // The block can be larger than the data in it, so the pathname ends at the first
+                // null.
+                std::wstring path(wpath, wcsnlen(wpath, GlobalSize(handle) / sizeof(wchar_t)));
+                GlobalUnlock(handle);
+                if (!path.empty())
+                    paths.push_back(std::move(path));
+            }
+        }
+    }
+    CloseClipboard();
+
+    if (paths.empty())
+        return false;
+
+    std::string uriList;
+    for (const std::wstring& path : paths)
+        uriList += pathToURI(Poco::Path(Util::wide_string_to_string(path))) + "\r\n";
+    pOutData->assign(uriList.begin(), uriList.end());
+
+    return true;
+}
+
+static bool clipboardProviderGetData(const char* pMimeType, std::vector<char>* pOutData)
+{
+    if (std::strcmp(pMimeType, "text/uri-list") == 0)
+        return getClipboardFilesAsUriList(pOutData);
+
+    auto formats = clipboard_formats_for_MIME_type(pMimeType);
+
+    if (formats.size() == 0)
+        return false;
+
+    if (!try_open_clipboard(NULL))
+        return false;
+
+    for (const auto& format : formats)
+    {
+        HANDLE handle;
+
+        if (format == CF_UNICODETEXT)
+        {
+            handle = GetClipboardData(format);
+            if (!handle)
+                continue;
+            wchar_t* wtext = (wchar_t*)GlobalLock(handle);
+            if (!wtext)
+                continue;
+
+            std::string text = Util::wide_string_to_string(std::wstring(wtext));
+            GlobalUnlock(handle);
+            (*pOutData).resize(text.length());
+            std::memcpy((*pOutData).data(), text.c_str(), text.length());
+
+            CloseClipboard();
+
+            return true;
+        }
+
+        handle = GetClipboardData(format);
+        if (!handle)
+            continue;
+        size_t size = GlobalSize(handle);
+        const char* source = (const char*)GlobalLock(handle);
+        if (!source)
+            continue;
+        std::string fragment;
+        if (format == RegisterClipboardFormatW(L"HTML Format"))
+        {
+            fragment = get_html_clipboard_fragment(source).c_str();
+            source = fragment.c_str();
+            size = std::strlen(source);
+        }
+        (*pOutData).resize(size);
+        std::memcpy((*pOutData).data(), source, size);
+        GlobalUnlock(handle);
+        CloseClipboard();
+
+        return true;
+    }
+
+    CloseClipboard();
+    return false;
+}
+
+
+// Install the process-global clipboard provider (declared in windows.hpp). After this the engine
+// advertises formats on copy and reads the clipboard on paste through the callbacks above, using
+// one shared clipboard for every document.
+void install_clipboard_provider(COKit& kitOffice)
+{
+    office = &kitOffice;
+
+    static COKitClipboardProvider provider{};
+    provider.advertiseToPlatform = clipboardProviderAdvertise;
+    provider.ownsClipboard = clipboardProviderOwns;
+    provider.getMimeTypes = clipboardProviderGetMimeTypes;
+    provider.getDataForMimeType = clipboardProviderGetData;
+    kitOffice.installClipboardProvider(&provider);
+}
+
+// The engine asks the user for a file. Copy the details, hand them to the hidden owner
+// window's thread, and let CODA_WM_SHOWFILEPICKER show the dialog there; the completion
+// answers from the dialog result.
+static void filePickerProviderPick(const char* pTitle, const COKitFilePickerFilter* pFilters,
+                                   size_t nFilters,
+                                   void (*pfnPicked)(void* pContext, const char* pUrl),
+                                   void* pContext)
+{
+    auto request = std::make_unique<FilePickerRequest>();
+    if (pTitle)
+        request->title = Util::string_to_wide_string(pTitle);
+    for (size_t i = 0; i < nFilters; ++i)
+        request->filters.push_back({ Util::string_to_wide_string(pFilters[i].pName),
+                                     Util::string_to_wide_string(pFilters[i].pWildcards) });
+    request->pfnPicked = pfnPicked;
+    request->pContext = pContext;
+
+    PostMessageW(hiddenOwnerWindow, CODA_WM_SHOWFILEPICKER,
+                 reinterpret_cast<WPARAM>(request.release()), 0);
+}
+
+void install_filepicker_provider(COKit& kitOffice)
+{
+    static COKitFilePickerProvider provider{};
+    provider.pick = filePickerProviderPick;
+    kitOffice.installFilePickerProvider(&provider);
+}
+
+void materialize_clipboard_formats()
+{
+    static bool beenHere = false;
+
+    if (beenHere)
+        return;
+
+    beenHere = true;
+
+    if (GetClipboardOwner() == hiddenOwnerWindow)
+    {
+        if (try_open_clipboard(hiddenOwnerWindow))
+        {
+            // Collect the promised formats first, then render each. Do not probe with
+            // GetClipboardData here(): on a still-promised format it would send
+            // WM_RENDERFORMAT again. Re-setting an already-rendered format is harmless.
+            std::vector<UINT> formats;
+            UINT format = 0;
+            while ((format = EnumClipboardFormats(format)) != 0)
+                formats.push_back(format);
+            for (UINT f : formats)
+            {
+                std::string mimeType = MIME_type_for_clipboard_format(f);
+                if (mimeType.empty())
+                    continue;
+                HANDLE hData = copyEngineClipboardData(f, mimeType);
+                if (hData)
+                    SetClipboardData(f, hData);
+            }
+            CloseClipboard();
+        }
+    }
+}
+
+// Closes the tab's document in the in-process kit.
+static void endLocalSession(DocumentTab& data)
+{
+    // Close the existing fakesocket
+    if (data.fakeClientFd != -1)
+    {
+        fakeSocketClose(data.fakeClientFd);
+        data.fakeClientFd = -1;
+    }
+
+    // Close the existing forwarding thread
+    if (data.app2js.joinable()) {
+        fakeSocketClose(data.closeNotificationPipeForForwardingThread[0]);
+        data.app2js.join();
+    }
+    else
+        DocumentData::deallocate(data.appDocId);
+}
+
+// Writes the remote document to a temporary file and returns its path.
+static void writeRemoteDocFile(DocumentTab& data, int id, const std::string& arguments)
+{
+    if (data.mode != DocumentMode::CLOUD_ACCOUNT)
+    {
+        LOG_WRN("A remote document was not written: the call is not from an account window");
+        postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        return;
+    }
+
+    std::string name;
+    std::string base64;
+    try
+    {
+        const auto values = Poco::JSON::Parser().parse(arguments).extract<Poco::JSON::Array::Ptr>();
+        name = values->getElement<std::string>(0);
+        base64 = values->getElement<std::string>(1);
+    }
+    catch (const Poco::Exception&)
+    {
+        LOG_WRN("A remote document was not written: the call has no name and bytes");
+        postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        return;
+    }
+
+    // The engine picks its import filter by the extension, which is
+    // the only part of the integrator's name that goes into the path.
+    const std::string extension = FileUtil::extractFileExtension(name);
+    if (docTypeFromFilename(name) == "other")
+    {
+        LOG_WRN("A remote document was not written: ." << extension << " is not a document type");
+        postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        return;
+    }
+
+    const std::string path = FileUtil::getSysTempDirectoryPath() + "\\coda-" +
+                             Util::rng::getFilename(6) + "." + extension;
+    const std::string bytes = Util::base64Decode(base64);
+    std::ofstream stream;
+
+    FileUtil::openFileToOFStream(path, stream, std::ios_base::out | std::ios_base::binary);
+    stream.write(bytes.data(), bytes.size());
+    stream.close();
+    if (!stream)
+    {
+        LOG_ERR("A remote document was not written: its local copy could not be written");
+        postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        return;
+    }
+
+    // A reload, or another document in the same window, ends the earlier document first.
+    endLocalSession(data);
+
+    data.fakeClientFd = fakeSocketSocket();
+    data.appDocId = generate_new_app_doc_id();
+    data.filenameAndUri = { name, pathToURI(Poco::Path(path)) };
+    postReplyToCall(data.hWnd, data.tabId, id, path);
+}
+
+// Returns the bytes of the document's local copy in base64.
+static void readLocalDocBytes(const DocumentTab& data, int id)
+{
+    std::ifstream stream;
+    FileUtil::openFileToIFStream(fileUriToWindowsPath(data.filenameAndUri.uri), stream,
+                                 std::ios_base::in | std::ios_base::binary);
+    if (!stream.is_open())
+    {
+        LOG_ERR("The local copy of a remote document cannot be read");
+        postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        return;
+    }
+
+    const std::string bytes((std::istreambuf_iterator<char>(stream)),
+                            std::istreambuf_iterator<char>());
+    postReplyToCall(data.hWnd, data.tabId, id, Util::base64Encode(bytes));
+}
+
+// The arguments are a JSON array with the path, like ["device-desktop.css"].
+static void getBundledFile(const DocumentTab& data, int id, const std::string& arguments)
+{
+    std::string name;
+    try
+    {
+        const auto values = Poco::JSON::Parser().parse(arguments).extract<Poco::JSON::Array::Ptr>();
+        name = values->getElement<std::string>(0);
+    }
+    catch (const Poco::Exception&)
+    {
+        LOG_WRN("A bundled file was not read: the call has no path");
+        postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        return;
+    }
+
+    const Poco::StringTokenizer tokens(name, "/");
+    const std::vector<std::string> segments(tokens.begin(), tokens.end());
+    const std::string path = bundledFilePath(segments);
+    if (path.empty())
+    {
+        LOG_WRN("A bundled file was not read: its path leads out of the folder");
+        postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        return;
+    }
+
+    // TODO: readFile fails for a file over 256 KiB, and the page then gets an
+    // empty reply. It should not, at least in this case.
+    std::string text;
+    if (FileUtil::readFile(path, text) < 0)
+    {
+        LOG_DBG("'" << name << "' could not be read from CODA's bundled folder");
+        postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        return;
+    }
+
+    postReplyToCall(data.hWnd, data.tabId, id, text);
+}
+
+// 1 MiB, the most a CheckFileInfo response can be.
+constexpr size_t MAX_FILE_INFO_BYTES = 1024 * 1024;
+
+constexpr int CHECK_FILE_INFO_TIMEOUT_SECONDS = 10;
+
+// The CheckFileInfo fields coolwsd passes on to the editor in its wopi: message.
+// TODO: qt/RemoteOpen.cpp has the same list. Move both to common/ with the request itself.
+const char* const EDITOR_FILE_INFO_FIELDS[] = {
+    "PostMessageOrigin", "BaseFileName", "BreadcrumbDocName", "TemplateSaveAs", "TemplateSource",
+    "HidePrintOption", "HideSaveOption", "HideExportOption", "HideRepairOption", "DisablePrint",
+    "DisableExport", "DisableCopy", "DisableInactiveMessages", "DownloadAsPostMessage",
+    "UserCanNotWriteRelative", "EnableInsertRemoteImage", "EnableInsertRemoteFile",
+    "DisableInsertLocalImage", "EnableRemoteLinkPicker", "EnableRemoteAIContent",
+    "DisableAISettings", "IsAnonymousUser", "EnableShare", "HideUserList", "SupportsRename",
+    "UserCanRename", "UserCanChangeSecurityLabel", "FileUrl", "UserCanWrite",
+    "HideChangeTrackingControls", "IsOwner", "PresentationLeader", "DisablePresentation",
+    "CommentAvatarUrl", "HostName",
+};
+
+static std::string editorFileInfo(const HttpResult& result)
+{
+    if (result.statusCode != 200)
+    {
+        LOG_WRN("CheckFileInfo failed with HTTP status " << result.statusCode);
+        return std::string();
+    }
+
+    if (result.body.size() > MAX_FILE_INFO_BYTES)
+    {
+        LOG_WRN("The CheckFileInfo response is " << result.body.size()
+                                                 << " bytes, over the limit of "
+                                                 << MAX_FILE_INFO_BYTES << " bytes");
+        return std::string();
+    }
+
+    Poco::JSON::Object::Ptr fileInfo;
+    try
+    {
+        fileInfo = Poco::JSON::Parser().parse(result.body).extract<Poco::JSON::Object::Ptr>();
+    }
+    catch (const Poco::Exception&)
+    {
+        LOG_WRN("The CheckFileInfo response is not a JSON object");
+        return std::string();
+    }
+
+    Poco::JSON::Object::Ptr editorFields = new Poco::JSON::Object();
+    for (const char* field : EDITOR_FILE_INFO_FIELDS)
+    {
+        if (fileInfo->has(field))
+            editorFields->set(field, fileInfo->get(field));
+    }
+
+    return JsonUtil::jsonToString(editorFields);
+}
+
+// Sends CheckFileInfo for the editor iframe's document and returns the fields an editor gets.
+static void checkFileInfo(const DocumentTab& data, int id, const std::string& arguments)
+{
+    std::string token;
+    try
+    {
+        const auto values = Poco::JSON::Parser().parse(arguments).extract<Poco::JSON::Array::Ptr>();
+        token = values->getElement<std::string>(0);
+    }
+    catch (const Poco::Exception&)
+    {
+        LOG_WRN("CheckFileInfo was not sent: the call has no token");
+        postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        return;
+    }
+
+    std::string wopiSrc;
+    for (const auto& [key, value] : Poco::URI(data.editorFormUrl).getQueryParameters())
+    {
+        if (key == "WOPISrc")
+            wopiSrc = value;
+    }
+
+    if (wopiSrc.empty())
+    {
+        LOG_WRN("CheckFileInfo was not sent: the editor form's address has no WOPISrc");
+        postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        return;
+    }
+
+    // TODO: Take the file info from coolwsd's "authenticated" message on /co/collab, which
+    // comes from the CheckFileInfo coolwsd does already, instead of sending one from here.
+    Poco::URI url(wopiSrc);
+    url.setQueryParameters({ { "access_token", token } });
+
+    const HWND hWnd = data.hWnd;
+    const int tabId = data.tabId;
+    std::thread(
+        [url = url.toString(), hWnd, tabId, id]()
+        {
+            ProcUtil::setThreadName("checkfileinfo");
+            const HttpResult result = winHttpRequest(L"GET", url, std::string(), std::string(),
+                                                     CHECK_FILE_INFO_TIMEOUT_SECONDS);
+            postReplyToCall(hWnd, tabId, id, editorFileInfo(result));
+        })
+        .detach();
+}
+
+static void processMessage(DocumentTab& data, wil::unique_cotaskmem_string& message)
+{
+    std::wstring s(message.get());
+    LOG_TRC(Util::wide_string_to_string(s));
+    if (s.starts_with(L"MSG "))
+    {
+        s = s.substr(4);
+        if (s == L"HULLO")
+        {
+            // If displaying the starter screen, do nothing
+            if (data.mode == DocumentMode::STARTER)
+                return;
+
+            if (data.fakeClientFd == -1)
+            {
+                LOG_WRN("HULLO was ignored: no document is open yet");
+                return;
+            }
+
+            do_hullo_handling_things(data);
+        }
+        else if (s == L"WELCOME" || s == L"WELCOME auto")
+        {
+            do_welcome_handling_things(data, s != L"WELCOME");
+        }
+        else if (s == L"FILEDRAGENTER")
+        {
+            // A drag carrying files has arrived over the web view. Take the drop away from the web
+            // view, so that the app gets to see what was dropped. Repeats while the drag is still
+            // in the part of the window the web view has, and stop once the overlay is up.
+            if (WindowState* window = findWindow(data.hWnd))
+                showDropOverlay(*window);
+        }
+        else if (s == L"BYE" || s == L"CLOSE_WINDOW")
+        {
+            // The page is done with its document, so its tab goes. The close of the tab
+            // says the goodbye, once.
+            data.readyToClose = true;
+            PostMessageW(data.hWnd, CODA_WM_CLOSETAB, (WPARAM)data.tabId, 0);
+        }
+        else if (s == L"CLOSE_CANCELLED")
+        {
+            // The user kept the document, so the window it is in stays. Other windows that are
+            // closing still go.
+            if (WindowState* window = findWindow(data.hWnd))
+                window->closingAll = false;
+        }
+        else if (s == L"switchToServerMode")
+        {
+            // The page now edits on the COOL server, so the local document is closed.
+            if (data.mode == DocumentMode::CLOUD_ACCOUNT && data.app2js.joinable())
+                endLocalSession(data);
+        }
+        else if (s == L"SAVESTARTED" || s == L"SAVECOMPLETED" || s == L"SAVEFAILED")
+        {
+            // The message does not go on to wsd. The live-view limit can wait for it, and by the
+            // time it comes the user can be back on this tab, so the limit is asked again rather
+            // than the WebView2 going now.
+            // TODO: An account window closes without asking its page, so a close during a save
+            // can cut off the upload. Defer it from SAVESTARTED to SAVECOMPLETED, as Qt does.
+            if ((s == L"SAVECOMPLETED" || s == L"SAVEFAILED") && data.dropWaitsForSave)
+            {
+                data.dropWaitsForSave = false;
+                if (WindowState* window = findWindow(data.hWnd))
+                    scheduleLiveViewLimit(*window, LIVE_VIEW_LIMIT_DELAY);
+            }
+        }
+        else if (s == L"SAVEFAILED prompt")
+        {
+            // The page is about to prompt about the failed save, and a hidden page shows no
+            // prompt.
+            WindowState* window = findWindow(data.hWnd);
+            if (window && window->activeTabId != data.tabId)
+                activateTab(*window, data.tabId);
+        }
+        else if (s == L"EXIT_TEST")
+        {
+            // The end of an automated test run. Every window closes, as for File > Quit, and the
+            // application exits.
+            quit_application();
+        }
+        else if (s == L"PRINT")
+        {
+            do_print(data.appDocId);
+        }
+        else if (s.starts_with(L"TEXTCLIPBOARD "))
+        {
+            // A plain-text copy from the web UI (for example the About dialog), not document
+            // content, so it does not go through the engine's clipboard. Own it with the same
+            // hidden window the provider uses, so no document window ever owns the clipboard.
+            std::wstring text = s.substr(14);
+            if (try_open_clipboard(hiddenOwnerWindow))
+            {
+                EmptyClipboard();
+                HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t));
+                if (hMem)
+                {
+                    memcpy(GlobalLock(hMem), text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+                    GlobalUnlock(hMem);
+                    SetClipboardData(CF_UNICODETEXT, hMem);
+                }
+                CloseClipboard();
+            }
+        }
+        else if (s.starts_with(L"TABTHUMBNAIL "))
+        {
+            // An image of what the document shows, as a "data:image/png;base64," URL. Anything
+            // else is ignored.
+            const std::string dataUrl = Util::wide_string_to_string(s.substr(13));
+            constexpr std::string_view prefix = "data:image/png;base64,";
+            if (!dataUrl.starts_with(prefix))
+                return;
+            std::string png = Util::base64Decode(dataUrl.substr(prefix.size()));
+            if (png.empty())
+                return;
+
+            // The strip only needs to know that a tab has an image, so later images skip the
+            // push.
+            const bool isFirstThumbnail = data.thumbnailPng.empty();
+            data.thumbnailPng = std::move(png);
+            WindowState* window = findWindow(data.hWnd);
+            if (isFirstThumbnail && window)
+                pushTabsToStrip(*window);
+            if (hoverCard.tabId == data.tabId && IsWindowVisible(hoverCard.hWnd))
+                showHoverCard();
+        }
+        else if (s.starts_with(L"HYPERLINK "))
+        {
+            do_open_hyperlink(data.hWnd, s.substr(10));
+        }
+        else if (s == L"LICENSE")
+        {
+            std::wstring licensePath = Util::string_to_wide_string(app_installation_path + "..\\LICENSE.html");
+            ShellExecuteW(nullptr, L"open", licensePath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        else if (s == L"EXCHANGEMONITORS")
+        {
+            exchangeMonitors(data);
+        }
+        else if (s.starts_with(L"FULLSCREENPRESENTATION "))
+        {
+            WindowState* window = findWindow(data.hWnd);
+            if (!window)
+                return;
+
+            window->isPresFullScreen = s.substr(23) == L"true";
+            if (window->isPresFullScreen)
+                arrangePresentationWindows(data);
+            else
+                leave_full_screen(*window);
+        }
+        else if (s == L"SYNCSETTINGS")
+        {
+            Desktop::syncSettings([&data](const std::vector<char>& buf) {
+                send2JS(data, buf.data(), buf.size());
+            });
+        }
+        else if (s.starts_with(L"UPLOADSETTINGS "))
+        {
+            uploadAndApplySettings(Util::wide_string_to_string(s.substr(strlen("UPLOADSETTINGS "))));
+        }
+        else if (s.starts_with(L"SETDARKMODE "))
+        {
+            Desktop::setDarkMode(s.substr(strlen("SETDARKMODE ")) == L"true");
+            applyTitleBarThemeToAllWindows();
+
+            // The tab strip is a page of its own and follows along.
+            for (auto& i : windows)
+                notifyStrip(i.second, "themeChanged", currentStripTheme());
+        }
+        else if (s.starts_with(L"COMMANDSTATECHANGED "))
+        {
+            Poco::JSON::Object::Ptr object;
+            if (!JsonUtil::parseJSON(Util::wide_string_to_string(s), object))
+                return;
+
+            if (object->optValue<std::string>("commandName", std::string()) !=
+                ".uno:ModifiedStatus")
+                return;
+
+            const bool modified =
+                object->optValue<std::string>("state", std::string()) == "true";
+            if (modified == data.isModified)
+                return;
+
+            // The tab shows a document with unwritten changes differently. A document whose
+            // changes have just reached its file can lose its WebView2 now.
+            data.isModified = modified;
+            if (WindowState* window = findWindow(data.hWnd))
+            {
+                pushTabsToStrip(*window);
+                if (!modified)
+                    scheduleLiveViewLimit(*window, LIVE_VIEW_LIMIT_DELAY);
+            }
+        }
+        else if (s.starts_with(L"downloadas "))
+        {
+            // "downloadas name=document.rtf id=export format=rtf options="
+            auto const ns = Util::wide_string_to_string(s);
+            auto const tokens = StringVector::tokenize(ns);
+            std::string name;
+            if (!COOLProtocol::getTokenString(tokens, "name", name))
+            {
+                LOG_ERR("No name parameter in message '" << ns << "'");
+                return;
+            }
+            auto dot = name.find_last_of('.');
+            if (dot == std::string::npos || dot == name.length() - 1)
+            {
+                LOG_ERR("No file name extension in '" << ns << "'");
+                return;
+            }
+            auto const extension = name.substr(dot + 1);
+            auto const basename = data.filenameAndUri.filename.substr(
+                0, data.filenameAndUri.filename.find_last_of('.'));
+            auto filenameAndUri = fileSaveDialog(data.hWnd, basename + "." + extension,
+                                                 "",
+                                                 {
+                                                     {
+                                                         Util::string_to_wide_string(extension).c_str(),
+                                                         Util::string_to_wide_string("*." + extension).c_str()
+                                                     }
+                                                 });
+
+            if (filenameAndUri.filename != "")
+                DocumentData::get(data.appDocId).loKitDocument->saveAs(filenameAndUri.uri.c_str(), extension.c_str(), nullptr);
+        }
+        else if (s.starts_with(L"exportfile "))
+        {
+            // "exportfile url=file:///C:/Users/.../tmp/image.png"
+            auto const ns = Util::wide_string_to_string(s);
+            auto const tokens = StringVector::tokenize(ns);
+            std::string fileUrl;
+            if (!COOLProtocol::getTokenString(tokens, "url", fileUrl))
+            {
+                LOG_ERR("No url parameter in message '" << ns << "'");
+                return;
+            }
+
+            const std::string srcPath = fileUriToWindowsPath(fileUrl);
+
+            if (!std::filesystem::exists(srcPath))
+            {
+                LOG_ERR("exportfile: source file not found: " << srcPath);
+                return;
+            }
+
+            auto const extension = Poco::Path(srcPath).getExtension();
+            auto filenameAndUri = fileSaveDialog(data.hWnd, "image." + extension,
+                                                 "",
+                                                 {
+                                                     {
+                                                         Util::string_to_wide_string(extension).c_str(),
+                                                         Util::string_to_wide_string("*." + extension).c_str()
+                                                     }
+                                                 });
+
+            if (filenameAndUri.filename != "")
+            {
+                const std::string destPath = fileUriToWindowsPath(filenameAndUri.uri);
+                std::error_code ec;
+                std::filesystem::copy_file(srcPath, destPath,
+                                           std::filesystem::copy_options::overwrite_existing, ec);
+                if (ec)
+                    LOG_ERR("exportfile: failed to copy to '" << destPath << "': " << ec.message());
+                else
+                    LOG_INF("exportfile: saved image to " << destPath);
+            }
+        }
+        else if (s.starts_with(L"extensionsavefile "))
+        {
+            // A JS extension (see browser Control.Extension.ts) generated a file
+            // - e.g. LibreLogo's PICTURE "x.svg" export - and asked to save it.
+            // The bytes travel base64 in the message; decode them and write to
+            // the user's chosen path, reusing the exportfile save dialog.
+            auto const ns = Util::wide_string_to_string(s);
+            auto const tokens = StringVector::tokenize(ns);
+            std::string encodedName, base64;
+            COOLProtocol::getTokenString(tokens, "name", encodedName);
+            if (!COOLProtocol::getTokenString(tokens, "data", base64))
+            {
+                LOG_ERR("extensionsavefile: no data= in message '" << ns << "'");
+                return;
+            }
+            std::string name;
+            Poco::URI::decode(encodedName, name);
+            if (name.empty())
+                name = "file";
+
+            // Decode the base64 payload.
+            DWORD cbBinary = 0;
+            if (!CryptStringToBinaryA(base64.c_str(), static_cast<DWORD>(base64.size()),
+                                      CRYPT_STRING_BASE64, nullptr, &cbBinary, nullptr, nullptr))
+            {
+                LOG_ERR("extensionsavefile: base64 decode sizing failed: " << GetLastError());
+                return;
+            }
+            std::vector<BYTE> bytes(cbBinary);
+            if (!CryptStringToBinaryA(base64.c_str(), static_cast<DWORD>(base64.size()),
+                                      CRYPT_STRING_BASE64, bytes.data(), &cbBinary, nullptr, nullptr))
+            {
+                LOG_ERR("extensionsavefile: base64 decode failed: " << GetLastError());
+                return;
+            }
+
+            auto const extension = Poco::Path(name).getExtension();
+            auto filenameAndUri = fileSaveDialog(
+                data.hWnd, Poco::Path(name).getFileName(), "",
+                extension.empty()
+                    ? std::vector<COMDLG_FILTERSPEC>{}
+                    : std::vector<COMDLG_FILTERSPEC>{
+                          { Util::string_to_wide_string(extension).c_str(),
+                            Util::string_to_wide_string("*." + extension).c_str() } });
+
+            if (filenameAndUri.filename != "")
+            {
+                const std::string destPath = fileUriToWindowsPath(filenameAndUri.uri);
+                std::ofstream out(destPath, std::ios::binary | std::ios::trunc);
+                if (!out || !out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size()))
+                    LOG_ERR("extensionsavefile: failed to write '" << destPath << "'");
+                else
+                    LOG_INF("extensionsavefile: saved " << destPath);
+            }
+        }
+        else if (s.starts_with(L"loaddocument "))
+        {
+            // "loaddocument url=file:///path/to/file.ext"
+            auto const ns = Util::wide_string_to_string(s);
+            auto const tokens = StringVector::tokenize(ns);
+            std::string url;
+            if (!COOLProtocol::getTokenString(tokens, "url", url))
+            {
+                LOG_ERR("No url parameter in message '" << ns << "'");
+                return;
+            }
+            endLocalSession(data);
+
+            data.fakeClientFd = fakeSocketSocket();
+            data.appDocId = generate_new_app_doc_id();
+            auto path = Poco::URI(url).getPath();
+            auto lastSlash = path.find_last_of('/');
+            auto filename = path.substr(lastSlash + 1);
+            const std::string previousUri = data.filenameAndUri.uri;
+            data.filenameAndUri = { filename, Poco::URI(url).toString() } ;
+            // The app picked the name of a new document, so only the name the user saved it as
+            // belongs in the recent list.
+            if (data.mode == DocumentMode::NEW)
+            {
+                recentFiles.remove(previousUri);
+                data.mode = DocumentMode::EDIT;
+            }
+            recentFiles.add(data.filenameAndUri.uri);
+            data.docType = docTypeFromFilename(filename);
+            data.isModified = false;
+            data.readyToClose = false;
+
+            // Connect to COOLWSD
+            int rc = fakeSocketConnect(data.fakeClientFd, coolwsd_server_socket_fd);
+            if (rc == -1)
+            {
+                LOG_ERR("loaddocument: failed to connect fakesocket");
+                return;
+            }
+
+            createAndStartMessagePumpThread(data);
+
+            // Send the initial message with the new file URL and appDocId
+            std::string message(data.filenameAndUri.uri + " " + std::to_string(data.appDocId));
+            fakeSocketWriteQueue(data.fakeClientFd, message.c_str(), message.size());
+
+            // Update window title and tab with new filename
+            if (WindowState* window = findWindow(data.hWnd))
+            {
+                if (window->activeTabId == data.tabId)
+                    SetWindowTextW(data.hWnd, windowTitleForTab(data).c_str());
+                pushTabsToStrip(*window);
+            }
+        }
+        else if (s == L"uno .uno:Open")
+        {
+            auto openResult = fileOpenDialog(
+                data.hWnd,
+                L"",
+                { { L"",
+                    L"*.odt;*.fodt;*.docx;*.docm;*.doc;*.rtf;*.txt;*.md;*.ods;*.fods;*.xlsx;*.xlsm;*.xls;*.odp;*.fodp;*.pptx;*.pptm;*.ppsx;*.ppt" },
+                  { L"", L"*.*" } },
+                true);
+            if (openResult.size() > 0)
+            {
+                for (const auto& i: openResult)
+                    filenamesAndUrisToOpen.push_back(i);
+
+                load_next_document();
+
+                // The picked document opens in a tab of its own; return the
+                // originating document to its document view, and close the
+                // starter it was picked from.
+                if (data.mode != DocumentMode::STARTER)
+                    PostMessageW(data.hWnd, CODA_WM_EXECUTESCRIPT,
+                                 (WPARAM)_strdup("window.app?.map?.backstageView?.returnToDocumentView()"),
+                                 (LPARAM)data.tabId);
+                else
+                    PostMessageW(data.hWnd, CODA_WM_CLOSETAB, (WPARAM)data.tabId, 0);
+            }
+        }
+        else if (s == L"uno .uno:SaveAs")
+        {
+            auto loKitDoc = DocumentData::get(data.appDocId).loKitDocument;
+            const COKitDocumentType docType = loKitDoc->getDocumentType();
+            auto formats = getSaveAsFormats(docType);
+
+            // The dialog starts with the name and the file type of the document. A type that
+            // is not in the list for this kind of document is added to the end of it.
+            const std::string& currentName = data.filenameAndUri.filename;
+            const auto currentDot = currentName.find_last_of('.');
+            std::wstring currentLabel, currentPattern;
+            size_t typeIndex = 0;
+            if (currentDot != std::string::npos && currentDot < currentName.length() - 1)
+            {
+                const std::string extension = Util::toLower(currentName.substr(currentDot + 1));
+                currentPattern = Util::string_to_wide_string("*." + extension);
+                const auto match = std::find_if(formats.begin(), formats.end(),
+                                                [&](const COMDLG_FILTERSPEC& format)
+                                                { return currentPattern == format.pszSpec; });
+                typeIndex = match - formats.begin();
+                if (match == formats.end())
+                {
+                    currentLabel = Util::string_to_wide_string(extension);
+                    for (wchar_t& c : currentLabel)
+                        c = std::towupper(c);
+                    formats.push_back({ currentLabel.c_str(), currentPattern.c_str() });
+                }
+            }
+            auto filenameAndUri = fileSaveDialog(data.hWnd, currentName, "", formats, typeIndex);
+
+            if (filenameAndUri.filename != "")
+            {
+                auto dot = filenameAndUri.filename.find_last_of('.');
+                if (dot == std::string::npos || dot == filenameAndUri.filename.length() - 1)
+                {
+                    LOG_ERR("No file name extension in '" << filenameAndUri.filename << "'");
+                    return;
+                }
+                // Send saveas command to COOLWSD with the selected format
+                std::string saveasCmd = "saveas url=" + filenameAndUri.uri +
+                    " format=" + filenameAndUri.filename.substr(dot + 1) +
+                    " options=";
+                fakeSocketWriteQueue(data.fakeClientFd, saveasCmd.c_str(), saveasCmd.size());
+            }
+        }
+        else if (s == L"uno .uno:CloseWin")
+        {
+            PostMessageW(data.hWnd, CODA_WM_CLOSETAB, (WPARAM)data.tabId, 0);
+        }
+        else if (s == L"uno .uno:Quit")
+        {
+            quit_application();
+        }
+        else if (s.starts_with(L"newdoc "))
+        {
+            auto const ns = Util::wide_string_to_string(s);
+            auto const tokens = StringVector::tokenize(ns);
+            std::string typeToken, templateToken, basenameToken;
+            if (!COOLProtocol::getTokenString(tokens, "type", typeToken))
+            {
+                LOG_ERR("No type parameter in message '" << ns << "'");
+                return;
+            }
+            if (!COOLProtocol::getTokenString(tokens, "basename", basenameToken))
+            {
+                LOG_ERR("No basename parameter in message '" << ns << "'");
+                return;
+            }
+            DocumentType type;
+            if (typeToken == "writer")
+                type = DocumentType::TEXT;
+            else if (typeToken == "calc")
+                type = DocumentType::SPREADSHEET;
+            else if (typeToken == "impress")
+                type = DocumentType::PRESENTATION;
+            else if (typeToken == "draw")
+                type = DocumentType::DRAWING;
+            else
+                fatal("Unexpected type in newdoc message");
+
+            // This might leave templateToken empty if it is an old-style newdoc message with just
+            // the type parameter.
+            COOLProtocol::getTokenString(tokens, "template", templateToken);
+            auto newDocument = new_document(type, templateToken, basenameToken);
+            if (newDocument != L"")
+            {
+                Poco::Path path = Poco::Path(Util::wide_string_to_string(newDocument));
+                openCOOLWindow({ path.getFileName(), pathToURI(path) }, DocumentMode::NEW);
+            }
+            if (data.mode == DocumentMode::STARTER)
+                PostMessageW(data.hWnd, CODA_WM_CLOSETAB, (WPARAM)data.tabId, 0);
+        }
+        else if (s.starts_with(L"openremote "))
+        {
+            // "openremote <url> account=<id>"
+            const StringVector tokens = StringVector::tokenize(Util::wide_string_to_string(s));
+            if (tokens.size() < 2)
+            {
+                LOG_WRN("An account was not opened: the message names no address");
+                return;
+            }
+
+            openAccountWindow(tokens[1]);
+        }
+        else if (s.starts_with(L"opendoc "))
+        {
+            auto const ns = Util::wide_string_to_string(s);
+            auto const tokens = StringVector::tokenize(ns);
+
+            // Despite the name, the "file" parameter in the opendoc message is a file: URI, not a
+            // pathname. Which is good as it reduces the character set confusion possibilities.
+            std::string fileToken;
+            if (!COOLProtocol::getTokenString(tokens, "file", fileToken))
+            {
+                LOG_ERR("No file parameter in message '" << ns << "'");
+                return;
+            }
+
+            // For some reason, the URI has been pointlessly percent-re-encoded.
+            fileToken = Uri::decode(fileToken);
+
+            std::vector<std::string> segments;
+            Poco::URI(fileToken).getPathSegments(segments);
+
+            if (segments.empty())
+            {
+                LOG_ERR("Weird file parameter in message '" << ns << "'");
+                return;
+            }
+
+            filenamesAndUrisToOpen.push_back({ segments.back(), fileToken });
+            load_next_document();
+            // Close the starter window
+            if (data.mode == DocumentMode::STARTER)
+                PostMessageW(data.hWnd, CODA_WM_CLOSETAB, (WPARAM)data.tabId, 0);
+        }
+        else
+        {
+            do_other_message_handling_things(data, Util::wide_string_to_string(s).c_str());
+        }
+    }
+    else if (s.starts_with(L"CALL "))
+    {
+        s = s.substr(5);
+        std::wstringstream ss(s);
+        int id;
+        ss >> id;
+        s = s.substr(s.find_first_of(L' ') + 1);
+
+        if (s == L"GETRECENTDOCS")
+        {
+            do_getrecentdocs(data, id);
+        }
+        else if (s.starts_with(L"FETCHSETTINGSFILE "))
+        {
+            auto result = Desktop::fetchSettingsFile(Util::wide_string_to_string(s.substr(strlen("FETCHSETTINGSFILE "))));
+            if (result.content.empty())
+            {
+                LOG_WRN("FETCHSETTINGSFILE found no file to return");
+                postReplyToCall(data.hWnd, data.tabId, id, std::string());
+                return;
+            }
+
+            // The JS caller reads result.content, so the reply is an object.
+            Poco::JSON::Object::Ptr reply = new Poco::JSON::Object();
+            reply->set("fileName", result.fileName);
+            reply->set("mimeType", result.mimeType);
+            reply->set("content", result.content);
+            postReplyToCall(data.hWnd, data.tabId, id, reply);
+        }
+        else if (s.starts_with(L"removecloudaccount "))
+        {
+            // There is nothing to delete for now.
+            // TODO: Give each account a WebView2 profile, as Qt does, and delete it here.
+            postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        }
+        else if (s == L"FETCHSETTINGSCONFIG")
+        {
+            postReplyToCall(data.hWnd, data.tabId, id, Desktop::fetchSettingsConfig());
+        }
+        else if (s.starts_with(L"FETCHAIMODELS "))
+        {
+            // The Options dialog asks for an AI provider's model list. This
+            // performs a network request, so run it off the message thread and
+            // reply asynchronously, mirroring the Qt and macOS apps.
+            const std::string payload =
+                Util::wide_string_to_string(s.substr(strlen("FETCHAIMODELS ")));
+            const HWND hWnd = data.hWnd;
+            const int tabId = data.tabId;
+            std::thread(
+                [payload, hWnd, tabId, id]()
+                {
+                    ProcUtil::setThreadName("aimodels");
+                    const std::string result = fetchAIModels(payload);
+                    postReplyToCall(hWnd, tabId, id, result);
+                })
+                .detach();
+        }
+        else if (s.starts_with(L"writeRemoteDocFile "))
+        {
+            const std::string arguments =
+                Util::wide_string_to_string(s.substr(strlen("writeRemoteDocFile ")));
+            writeRemoteDocFile(data, id, arguments);
+        }
+        else if (s.starts_with(L"readLocalDocBytes "))
+        {
+            readLocalDocBytes(data, id);
+        }
+        else if (s.starts_with(L"checkFileInfo "))
+        {
+            const std::string arguments =
+                Util::wide_string_to_string(s.substr(strlen("checkFileInfo ")));
+            checkFileInfo(data, id, arguments);
+        }
+        else if (s.starts_with(L"getBundledFile "))
+        {
+            const std::string arguments =
+                Util::wide_string_to_string(s.substr(strlen("getBundledFile ")));
+            getBundledFile(data, id, arguments);
+        }
+        else if (s.starts_with(L"saveCompleted "))
+        {
+            // CODA-W keeps no state for a save in flight, so there is nothing to clear.
+            postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        }
+        else if (s.starts_with(L"getAllPrefs "))
+        {
+            // TODO: CODA-W has no store for the preferences yet.
+            postReplyToCall(data.hWnd, data.tabId, id, std::string("{}"));
+        }
+        else if (s.starts_with(L"setPref "))
+        {
+            LOG_DBG("A preference was not kept: CODA-W has no store for the preferences yet");
+            postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        }
+        else
+        {
+            // The page code that made the call waits for a reply.
+            LOG_ERR("Unhandled CALL message: " + Util::wide_string_to_string(s));
+            postReplyToCall(data.hWnd, data.tabId, id, std::string());
+        }
+    }
+    else if (s.starts_with(L"ERR "))
+    {
+        LOG_ERR("From JS: " + Util::wide_string_to_string(s));
+    }
+    else if (s.starts_with(L"DBG "))
+    {
+        LOG_DBG("From JS: " + Util::wide_string_to_string(s));
+    }
+}
+
+extern "C" BOOLEAN WINAPI GetUserNameExW(
+    ULONG NameFormat,   // EXTENDED_NAME_FORMAT underlying type
+    LPWSTR lpNameBuffer,
+    PULONG nSize
+);
+
+static const char* getUserName()
+{
+    static wchar_t buffer[256];
+    static std::string userNameStorage;
+    DWORD size = sizeof(buffer) / sizeof(wchar_t);
+
+    // Try full display name
+    if (GetUserNameExW(3 /* NameDisplay */, buffer, &size)) {
+        if (buffer[0] != L'\0') {
+            userNameStorage = Util::wide_string_to_string(std::wstring(buffer));
+            return userNameStorage.c_str();
+        }
+    }
+
+    // Reset size before next call
+    size = sizeof(buffer) / sizeof(wchar_t);
+
+    // Fallback: login name
+    if (GetUserNameW(buffer, &size)) {
+        if (buffer[0] != L'\0') {
+            userNameStorage = Util::wide_string_to_string(std::wstring(buffer));
+            return userNameStorage.c_str();
+        }
+    }
+
+    return nullptr;
+}
+
+// These functions in the Desktop namespace are called from SettingsStorage.cpp. Unclear whether
+// will be needed in the end. The name comes from CODA-Q. Should ideally be changed to FileUtil,
+// perhaps.
+
+// Expected to return the folder where installed data for the app is stored. Should not end with a
+// slash (or backslash). Note the impedance mismatch with our app_installation_path.
+std::string Desktop::getDataDir()
+{
+    std::string result = app_installation_path;
+    if (!(result.ends_with("/") || result.ends_with("\\")))
+        result += "/";
+    result += "..";
+    return result;
+}
+
+Poco::Path Desktop::getConfigPath()
+{
+    return Poco::Path(localAppData);
+}
+
+int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int showWindowMode)
+{
+    appInstance = hInstance;
+    appShowMode = showWindowMode;
+
+    user_name = getUserName();
+
+    wchar_t fileName[1000];
+    GetModuleFileNameW(NULL, fileName, sizeof(fileName) / sizeof(fileName[0]));
+    app_installation_path = app_exe_path = Util::wide_string_to_string(std::wstring(fileName));
+    app_installation_path.resize(app_installation_path.find_last_of(L'\\') + 1);
+    app_installation_uri = pathToURI(Poco::Path(app_installation_path));
+
+#if ENABLE_DEBUG
+    // cool/ next to the install root is the vcxproj's robocopy of browser/dist/:
+    Extensions::synthesizeBuiltinExtensionsIndex(app_installation_path + "..\\cool\\extensions");
+#endif
+
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    appName = Util::string_to_wide_string(APP_NAME);
+
+    if (!SUCCEEDED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)))
+        fatal("CoInitializeEx() failed");
+
+    // Drag and drop needs the OLE libraries on top of COM. The drop target that DragAcceptFiles()
+    // installs to turn a drop into a WM_DROPFILES message is registered through RegisterDragDrop(),
+    // which works only once OLE has been initialized. The apartment stays as CoInitializeEx() set it
+    // up above.
+    if (!SUCCEEDED(OleInitialize(NULL)))
+        fatal("OleInitialize() failed");
+
+    primaryMonitor = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+
+    UINT32 length = 0;
+    LONG rc = GetCurrentApplicationUserModelId(&length, NULL);
+    if (rc == ERROR_INSUFFICIENT_BUFFER)
+    {
+        appUserModelId.resize(length);
+        GetCurrentApplicationUserModelId(&length, appUserModelId.data());
+    }
+    else
+    {
+        appUserModelId = Util::string_to_wide_string(APP_VENDOR) + L"." + appName;
+        rc = SetCurrentProcessExplicitAppUserModelID(appUserModelId.c_str());
+    }
+
+    PWSTR appDataFolder;
+    SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, NULL, &appDataFolder);
+    localAppData = Util::wide_string_to_string(std::wstring(appDataFolder) + L"\\" + appName);
+    CoTaskMemFree(appDataFolder);
+
+    // CODA_TEST_DATA_DIR is a folder for the settings, the recent files list and the WebView2
+    // profile, in place of the folder under LocalAppData. A test run then starts from nothing and
+    // leaves the data of the user alone.
+    if (const wchar_t* testDataDir = _wgetenv(L"CODA_TEST_DATA_DIR"))
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(testDataDir, ec);
+        localAppData = Util::wide_string_to_string(testDataDir);
+    }
+
+    if (const wchar_t* testDocuments = _wgetenv(L"CODA_TEST_DOCUMENTS_DIR"))
+        testDocumentsDir = testDocuments;
+
+    if (const wchar_t* testPort = _wgetenv(L"CODA_TEST_REMOTE_DEBUGGING_PORT"))
+    {
+        const std::wstring port = testPort;
+        if (!port.empty() && port.find_first_not_of(L"0123456789") == std::wstring::npos)
+            testRemoteDebuggingPort = port;
+    }
+
+    // Wire up the ODF IFilter into Windows Search and the FullDetails /
+    // PreviewDetails strings the Properties dialog needs, both under
+    // HKCU\Software\Classes. See registerOdfShellExtensions() for the
+    // silo-escape mechanism. Idempotent on every launch.
+    registerOdfShellExtensions();
+
+    // A "LANG" environment variable is not a thing on Windows, but check
+    // for a such anyway, for easier testing.
+    auto langEnv = std::getenv("LANG");
+
+    wchar_t bcp47[LOCALE_NAME_MAX_LENGTH];
+
+    if (langEnv)
+        uiLanguage = langEnv;
+    else if (LCIDToLocaleName(MAKELCID(GetUserDefaultUILanguage(), SORT_DEFAULT),
+                              bcp47, LOCALE_NAME_MAX_LENGTH, 0))
+        uiLanguage = Util::wide_string_to_string(bcp47);
+
+    // Allow overriding log level in the debugger. Note that logging *always* goes just to
+    // OutputDebugString() if running under a debugger. Never to stderr or stdout.
+    const char* loglevel = std::getenv("CODA_LOGLEVEL");
+    // COOLWSD_LOGLEVEL comes from the project file and differs for Debug and Release builds.
+    if (!loglevel)
+        loglevel = COOLWSD_LOGLEVEL;
+    Log::initialize("CODA", loglevel);
+    ProcUtil::setThreadName("main");
+
+    loadTranslations();
+
+    recentFiles.load(localAppData + "\\recentFiles.txt", 10);
+
+    // Create a dummy hidden owner window so that the file open dialog can inherit its icon for the
+    // task switcher (Alt-Tab) from it.
+
+    {
+        WNDCLASSEXW wcex;
+
+        wcex.cbSize = sizeof(WNDCLASSEXW);
+        wcex.style = 0;
+        wcex.lpfnWndProc = HiddenOwnerWndProc;
+        wcex.cbClsExtra = 0;
+        wcex.cbWndExtra = 0;
+        wcex.hInstance = hInstance;
+        wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_CODA));
+        wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wcex.lpszMenuName = NULL;
+        wcex.lpszClassName = hiddenOwnerWindowClass;
+        wcex.hIconSm = NULL;
+
+        if (!RegisterClassExW(&wcex))
+        {
+            MessageBoxW(NULL, L"Call to RegisterClassExW failed", Util::string_to_wide_string(APP_NAME).c_str(), NULL);
+            return 1;
+        }
+
+        hiddenOwnerWindow = CreateWindowW(hiddenOwnerWindowClass, L"CODAHiddenOwnerWindow",
+                                          WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                                          100, 100, NULL, NULL,
+                                          hInstance, NULL);
+        ShowWindow(hiddenOwnerWindow, SW_HIDE);
+    }
+
+    DocumentMode mode = DocumentMode::EDIT;
+    if (__argc == 1 || wcscmp(__wargv[1], L"--disable-background-networking") == 0)
+    {
+        // No documents given on the command line, show the "Starter" "Backstage" dialog
+        mode = DocumentMode::STARTER;
+    }
+    else
+    {
+        for (int i = 1; i < __argc; i++)
+        {
+            auto path = Poco::Path(Util::wide_string_to_string(__wargv[i]));
+            filenamesAndUrisToOpen.push_back({ path.getFileName(), pathToURI(path) });
+        }
+    }
+
+    fakeSocketSetLoggingCallback([](const std::string& line) { LOG_TRC_NOFILE(line); });
+
+    // Give AIChatSession a native HTTP transport (no server-side AI proxy here).
+    registerAIHttpTransport();
+
+    coolwsdThread = std::thread(
+        []
+        {
+            assert(coolwsd == nullptr);
+            char* argv[2];
+            // Yes, strdup() is apparently not standard, so MS wants you to call it as
+            // _strdup(), and warns if you call strdup(). Sure, we could just silence such
+            // warnings, but let's try to do as they want.
+            argv[0] = _strdup("mobile");
+            argv[1] = nullptr;
+            ProcUtil::setThreadName("app");
+            coolwsd = new COOLWSD();
+            coolwsd->run(1, argv);
+            // We will actually not get here, Util::forcedExit() will be called
+            delete coolwsd;
+            coolwsd = nullptr;
+            LOG_TRC("COOLWSD completed");
+        });
+
+    {
+        WNDCLASSEXW wcex;
+
+        wcex.cbSize = sizeof(WNDCLASSEXW);
+        wcex.style = CS_HREDRAW | CS_VREDRAW;
+        wcex.lpfnWndProc = WndProc;
+        wcex.cbClsExtra = 0;
+        wcex.cbWndExtra = 0;
+        wcex.hInstance = hInstance;
+        wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_CODA));
+        wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
+        // The window frame shows through until a WebView2 covers it, so it follows the dark mode
+        // the app will use, which is the saved choice where there is one and the system theme
+        // otherwise. The class keeps the brush it is registered with, so a later change of theme
+        // reaches the frame only on the next run.
+        if (darkModeEnabled())
+            wcex.hbrBackground = CreateSolidBrush(RGB(0x12, 0x12, 0x12));
+        else
+            wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wcex.lpszMenuName = NULL;
+        wcex.lpszClassName = windowClass;
+        wcex.hIconSm = NULL;
+
+        if (!RegisterClassExW(&wcex))
+        {
+            MessageBoxW(NULL, L"Call to RegisterClassExW failed", Util::string_to_wide_string(APP_NAME).c_str(), NULL);
+            return 1;
+        }
+   }
+
+    {
+        // The class of the transparent window that catches drops over the web view. It shows
+        // nothing of its own, so it needs no window procedure or icon.
+        WNDCLASSEXW wcex = { sizeof(WNDCLASSEXW) };
+
+        wcex.lpfnWndProc = DefWindowProcW;
+        wcex.hInstance = hInstance;
+        wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wcex.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+        wcex.lpszClassName = overlayWindowClass;
+
+        if (!RegisterClassExW(&wcex))
+            fatal("RegisterClassExW() for the drop overlay window failed");
+    }
+
+    {
+        WNDCLASSEXW wcex = { sizeof(WNDCLASSEXW) };
+
+        // A drop shadow, as on the tooltips of the system.
+        wcex.style = CS_DROPSHADOW;
+        wcex.lpfnWndProc = HoverCardWndProc;
+        wcex.hInstance = hInstance;
+        wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
+        wcex.lpszClassName = hoverCardWindowClass;
+
+        if (!RegisterClassExW(&wcex))
+            fatal("RegisterClassExW() for the tab hover card failed");
+    }
+
+    // Open the first document here, then open the rest one by one once the previous has loaded.
+    if (mode == DocumentMode::STARTER)
+        openCOOLWindow({ }, mode);
+    else
+        load_next_document();
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0))
+    {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    return (int)msg.wParam;
+}
+
+// vim:set shiftwidth=4 softtabstop=4 expandtab:

@@ -1,0 +1,57 @@
+name: Build Collabora native editors
+on:
+  push:
+    paths: ['.github/workflows/collabora-build.yml', 'collabora/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: collabora-native-build
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate source preparation
+        shell: pwsh
+        run: python collabora/test_prepare.py
+      - name: Set up MSYS2 toolchain
+        id: msys
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          update: true
+          install: autoconf automake libtool m4 make gcc bison flex gperf nasm zip unzip gettext gettext-devel patch pkgconf python python-lxml python-pip perl
+      - name: Install MSYS2 Python helper
+        shell: msys2 {0}
+        run: python3 -m pip install --break-system-packages polib
+      - name: Install checksum-verified native dependencies
+        shell: pwsh
+        run: |
+          ./collabora/ci-dependencies.ps1
+          "MSYS2_ROOT=${{ steps.msys.outputs.msys2-location }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Get-PSDrive C | Format-List Name,Free,Used
+      - name: Build engine and native desktop hosts
+        shell: bash
+        run: bash collabora/ci-build.sh
+      - name: Retain configuration and build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collabora-build-logs
+          path: |
+            C:/of-build/*.log
+            C:/of-build/engine/config.log
+            C:/of-build/online/config.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Retain development payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: officeflow-native-development
+          path: C:/of-build/online/windows/coda/x64/Release/
+          retention-days: 7
