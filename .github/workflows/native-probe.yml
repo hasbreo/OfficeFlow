@@ -1,0 +1,39 @@
+name: Probe official Collabora desktop runtime
+on:
+  push:
+    paths: ['.github/workflows/native-probe.yml', 'ci/probe-native.cjs']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-probe:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 20
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download and verify official runtime fixture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          Invoke-WebRequest 'https://www.collaboraoffice.com/downloads/Collabora-Office-Windows-Snapshot/CollaboraOffice-Winx64-26.04.6.1-122.zip' -OutFile "$env:RUNNER_TEMP/collabora.zip"
+          if ((Get-FileHash "$env:RUNNER_TEMP/collabora.zip" -Algorithm SHA256).Hash.ToLowerInvariant() -ne '0efb6e08af581386e7e3d983b0347f9291c223eab2f40a3ae8ba98271bf5ae7e') { throw 'Runtime fixture checksum mismatch' }
+          Expand-Archive "$env:RUNNER_TEMP/collabora.zip" "$env:RUNNER_TEMP/collabora"
+      - name: Install test client
+        run: npm install --no-save --package-lock=false playwright@1.65.0
+      - name: Open all three document types with the native engine
+        shell: pwsh
+        run: node ci/probe-native.cjs "$env:RUNNER_TEMP/collabora"
+      - name: Retain synthetic test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collabora-native-probe
+          path: |
+            probe-results/*.png
+            probe-results/*.txt
+          if-no-files-found: ignore
+          retention-days: 7
