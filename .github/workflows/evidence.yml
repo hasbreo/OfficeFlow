@@ -4,41 +4,70 @@ on:
     workflows: ['Package and verify OfficeFlow suite']
     types: [completed]
     branches: [main]
+  push:
+    branches: [main]
+    paths: ['.github/workflows/evidence.yml']
 permissions:
   contents: write
   actions: read
 jobs:
   evidence:
-    if: github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure'
+    if: github.event_name == 'push' || github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Select completed suite verification
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SOURCE_RUN" ]; then
+            SOURCE_RUN=$(gh api 'repos/hasbreo/OfficeFlow/actions/workflows/suite-package.yml/runs?per_page=20' --jq '[.workflow_runs[] | select(.conclusion == "success" or .conclusion == "failure")][0].id')
+          fi
+          gh api "repos/hasbreo/OfficeFlow/actions/runs/$SOURCE_RUN" > "$RUNNER_TEMP/source-run.json"
+          python3 - <<'PY'
+          import os,json
+          from pathlib import Path
+          run=json.loads((Path(os.environ['RUNNER_TEMP'])/'source-run.json').read_text())
+          assert run['conclusion'] in ('success','failure')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output:
+              for key,value in {'id':run['id'],'sha':run['head_sha'],'result':run['conclusion'],'attempt':run['run_attempt']}.items():
+                  output.write(f'{key}={value}\n')
+          PY
       - uses: actions/download-artifact@v4
         with:
           name: officeflow-suite-test-evidence
           path: verification
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ github.event.workflow_run.id }}
+          run-id: ${{ steps.source.outputs.id }}
       - name: Publish only synthetic screenshots and UI text
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SOURCE_RUN: ${{ github.event.workflow_run.id }}
-          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
-          SOURCE_RESULT: ${{ github.event.workflow_run.conclusion }}
-          SOURCE_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          SOURCE_RUN: ${{ steps.source.outputs.id }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          SOURCE_RESULT: ${{ steps.source.outputs.result }}
         run: |
           set -euo pipefail
           mkdir evidence-repository
           find verification -maxdepth 1 -type f \( -name '*.png' -o -name '*.txt' \) -exec cp {} evidence-repository/ \;
           test "$(find evidence-repository -name '*.png' | wc -l)" -gt 0
+          python3 - <<'PY'
+          import base64,json
+          from pathlib import Path
+          for image in Path('evidence-repository').glob('*.png'):
+              image.with_suffix('.png.json').write_text(json.dumps({'file_name':image.name,'mime_type':'image/png','data':base64.b64encode(image.read_bytes()).decode()}))
+          PY
           printf 'OfficeFlow synthetic Windows verification\nSource run: %s\nSource commit: %s\nResult: %s\nNo user documents, accounts or profiles are included.\n' "$SOURCE_RUN" "$SOURCE_SHA" "$SOURCE_RESULT" > evidence-repository/README.txt
           cd evidence-repository
           git init
           git config user.name 'OfficeFlow verification'
           git config user.email 'verification@users.noreply.github.com'
-          git add -- '*.png' '*.txt'
+          git add -- '*.png' '*.txt' '*.json'
           git commit -m "OfficeFlow synthetic Windows verification $SOURCE_RUN [skip ci]"
           git remote add origin https://github.com/hasbreo/OfficeFlow.git
           gh auth setup-git --hostname github.com
-          git push origin HEAD:refs/heads/verification-0.5.0-$SOURCE_RUN-$SOURCE_ATTEMPT
+          git push origin HEAD:refs/heads/verification-0.5.0-$SOURCE_RUN-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT
