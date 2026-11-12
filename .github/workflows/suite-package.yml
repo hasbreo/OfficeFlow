@@ -130,16 +130,18 @@ jobs:
             probe-results/*.pdf
           if-no-files-found: ignore
           retention-days: 7
-      - name: Publish the verified candidate assets
+      - name: Record verified release checksums
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $setup=Join-Path $env:OFFICEFLOW_CANDIDATE 'OfficeFlow-Setup-0.5.0.exe'
           $source=Join-Path $env:OFFICEFLOW_CANDIDATE 'OfficeFlow-0.5.0-source.zip'
-          $sum=Join-Path $env:RUNNER_TEMP 'SHA256SUMS.txt'
+          $sum=Join-Path $env:OFFICEFLOW_CANDIDATE 'SHA256SUMS.txt'
           @($setup,$source) | ForEach-Object { (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant()+'  '+(Split-Path $_ -Leaf) } | Set-Content $sum -Encoding utf8NoBOM
-          $commit=(Get-Content "$env:OFFICEFLOW_CANDIDATE/build.json" -Raw | ConvertFrom-Json).commit
-          $tag="candidate-0.5.0-$env:GITHUB_RUN_ID"
-          gh release create $tag $setup $source $sum --repo hasbreo/OfficeFlow --target $commit --title 'OfficeFlow 0.5.0 — verified Windows candidate' --prerelease --latest=false --notes 'Source-built Collabora document apps with the shared MailFlow/PDFFlow installer. Native edit/save/reopen, PDF export, independent shortcuts, Windows identities, upgrade and mail retention checks passed. Candidate assets are available here before promotion to the signed Hasbreo.com updater feed.'
-          if($LASTEXITCODE -ne 0){throw 'Verified candidate asset publication failed'}
+      - name: Retain the verified installer and matching source
+        uses: actions/upload-artifact@v4
+        with:
+          name: officeflow-verified-release
+          overwrite: true
+          path: ${{ env.OFFICEFLOW_CANDIDATE }}/
+          compression-level: 0
+          retention-days: 7
