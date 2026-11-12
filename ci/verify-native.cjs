@@ -41,7 +41,10 @@ async function close(child){
    if(!process.argv.includes('--expect-editable')&&await page.getByText('Viewing',{exact:true}).isVisible()){
     await page.getByText('Viewing',{exact:true}).click();await page.getByText('Editing Mode',{exact:true}).click();
    }
-   await page.waitForFunction(()=>app.map.isEditMode(),null,{timeout:30000});
+   await page.waitForFunction(()=>app.map.isEditMode()&&app.map._docLoaded&&app.onboardingTour,null,{timeout:45000});
+   // Complete the first-run tour in this isolated test profile before editing.
+   await page.evaluate(()=>{app.map.uiManager.setDocTypePref('onboardingTourSeen',true);app.onboardingTour.end();});
+   console.log(name+' core readiness',await page.evaluate(()=>({editDoc:app.map.stateChangeHandler.getItemValue('EditDoc'),save:app.map.stateChangeHandler.getItemValue('Save'),modified:app.file.modified})));
    const before=await readPart(doc,part);
    if(name==='WordFlow'){await page.evaluate(()=>app.map.focus());await page.keyboard.type('OfficeFlow saved document test');}
    else if(name==='CellFlow'){
@@ -55,7 +58,20 @@ async function close(child){
      await page.waitForFunction(next=>document.querySelector('#addressInput input')?.value===next,next,{timeout:15000});
     }
    }else await page.evaluate(()=>app.map.insertPage());
-   await page.evaluate(()=>app.map.save(false,false));let good=false;const until=Date.now()+45000;
+   // Keyboard input and engine saves are asynchronous. Wait for the engine's
+   // modified acknowledgement and save response before opening its output file.
+   await page.waitForFunction(()=>app.file.modified===true,null,{timeout:30000});
+   console.log(name+' before save',await page.evaluate(()=>({editDoc:app.map.stateChangeHandler.getItemValue('EditDoc'),save:app.map.stateChangeHandler.getItemValue('Save'),modified:app.file.modified})));
+   await page.evaluate(()=>{
+    globalThis.__officeFlowSaveResult=null;
+    const done=event=>{if(event.msgId==='Action_Save_Resp'){globalThis.__officeFlowSaveResult=event.args;app.map.off('postMessage',done);}};
+    app.map.on('postMessage',done);app.map.save(false,false);
+   });
+   await page.waitForFunction(()=>globalThis.__officeFlowSaveResult!==null,null,{timeout:45000});
+   const saved=await page.evaluate(()=>globalThis.__officeFlowSaveResult);
+   assert(saved.success===true||saved.success==='true',name+' native save failed: '+JSON.stringify(saved));
+   await page.waitForFunction(()=>app.file.modified===false,null,{timeout:30000});
+   let good=false;const until=Date.now()+45000;
    while(Date.now()<until){
     try{const xml=await readPart(doc,part);
      const b1=xml.match(/<c\b[^>]*\br="B1"[^>]*>[\s\S]*?<\/c>/)?.[0]||'';
