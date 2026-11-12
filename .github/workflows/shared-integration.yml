@@ -1,0 +1,33 @@
+name: Validate shared app integration
+on:
+  push:
+    paths: ['integration/**', '.github/workflows/shared-integration.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  shared:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Obtain checksum-pinned shared app source
+        shell: pwsh
+        run: ./integration/fetch-shared.ps1
+      - name: Apply native startup and updater integration
+        shell: pwsh
+        run: |
+          python integration/prepare-shared.py "$env:OFFICEFLOW_SHARED"
+          node --test integration/shared/*.test.cjs
+          node --check "$env:OFFICEFLOW_SHARED/desktop/main.cjs"
+          node --check "$env:OFFICEFLOW_SHARED/desktop/legacy-main.cjs"
+      - name: Build MailFlow and PDFFlow frontend
+        shell: pwsh
+        run: |
+          Set-Location $env:OFFICEFLOW_SHARED
+          npm ci --no-audit --no-fund
+          if($LASTEXITCODE -ne 0){throw 'Dependency installation failed'}
+          npm run build
+          if($LASTEXITCODE -ne 0){throw 'Shared app build failed'}
