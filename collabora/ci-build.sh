@@ -25,7 +25,7 @@ cat > "$build_dir/autogen.input" <<'EOF'
 --with-strawberry-perl-portable=C:\of-tools\spp
 --with-external-tar=C:\of-downloads
 --with-lang=en-US
---with-parallelism=2
+--with-parallelism=4
 --without-junit
 PKG_CONFIG=/c/of-tools/bin/pkgconf-2.4.3.exe
 MAKE=/c/of-tools/bin/make.exe

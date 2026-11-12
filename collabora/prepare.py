@@ -53,7 +53,22 @@ def prepare(checkout):
     if current_types not in (original_types, patched_types):
         raise ValueError('Refusing to overwrite other edits to backstage types')
     types.write_text(patched_types)
+    build_rules = checkout / 'engine/solenv/gbuild/LinkTarget.mk'
+    build_rules.write_text(patch_nasm_paths(build_rules.read_text()))
     return head
+
+def patch_nasm_paths(text):
+    # MSYS2's NASM is a native executable: its output path must remain C:/...
+    # Other MSYS2 tools still require the original helper conversion.
+    old = '$(call gb_Helper_wsl_path,$(NASM) $(T_NASMFLAGS)'
+    new = '$(call gb_Helper_nasm_path,$(NASM) $(T_NASMFLAGS)'
+    marker = '# OfficeFlow: preserve native NASM output paths outside WSL.'
+    if marker in text:
+        return text
+    if text.count(old) != 1:
+        raise ValueError('Upstream NASM rule changed; inspect before building')
+    declaration = marker + '\n' + 'gb_Helper_nasm_path = $(if $(WSL),$(call gb_Helper_wsl_path,$(1)),$(1))\n\n'
+    return declaration + text.replace(old, new)
 
 def patch_native_ui(text):
     native = patch_identity(text)

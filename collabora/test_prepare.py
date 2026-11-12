@@ -36,6 +36,14 @@ class NativeIdentityPatch(unittest.TestCase):
         for action in ['executePrint()', 'executeSave()', 'executeSaveAs()', 'executeOptions()']:
             self.assertEqual(original.count(action), patched.count(action))
 
+    def test_native_nasm_paths_preserve_windows_output(self):
+        original = '$(call gb_Helper_wsl_path,$(NASM) $(T_NASMFLAGS) test.asm -o $@)'
+        patched = module.patch_nasm_paths(original)
+        self.assertIn('gb_Helper_nasm_path',patched)
+        self.assertEqual(patched,module.patch_nasm_paths(patched))
+        self.assertIn('$(if $(WSL),',patched)
+        with self.assertRaises(ValueError): module.patch_nasm_paths('unexpected rule')
+
     def test_blank_packages_are_valid_office_files(self):
         import zipfile
         for filename, part in [('TextDocument.docx','word/document.xml'),('Spreadsheet.xlsx','xl/workbook.xml'),('Presentation.pptx','ppt/presentation.xml')]:
