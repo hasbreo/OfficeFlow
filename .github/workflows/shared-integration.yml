@@ -31,3 +31,30 @@ jobs:
           if($LASTEXITCODE -ne 0){throw 'Dependency installation failed'}
           npm run build
           if($LASTEXITCODE -ne 0){throw 'Shared app build failed'}
+      - name: Verify packaged MailFlow, PDFFlow and updater startup
+        shell: pwsh
+        run: |
+          Set-Location $env:OFFICEFLOW_SHARED
+          npx electron-builder --win dir --x64 --config.directories.output=release-smoke
+          if($LASTEXITCODE -ne 0){throw 'Shared runtime packaging failed'}
+          node scripts/build-app-identities.mjs release-smoke/win-unpacked
+          if($LASTEXITCODE -ne 0){throw 'Windows identity preparation failed'}
+          Copy-Item release-smoke/win-unpacked/OfficeFlow.exe release-smoke/win-unpacked/OfficeFlowUpdater.exe
+          $payload=Join-Path $env:OFFICEFLOW_SHARED 'release-smoke/win-unpacked'
+          Set-Location $env:GITHUB_WORKSPACE
+          npm install --no-save --package-lock=false playwright@1.65.0
+          New-Item -ItemType Directory -Force "$env:APPDATA/officeflow" | Out-Null
+          Set-Content "$env:APPDATA/officeflow/settings.json" '{"autoUpdates":false,"theme":"dark"}' -Encoding utf8NoBOM
+          node ci/verify-shared.cjs "$payload"
+          if($LASTEXITCODE -ne 0){throw 'Packaged app startup failed'}
+          $p=Start-Process -FilePath "$payload/OfficeFlowUpdater.exe" -ArgumentList '--update-helper','--startup' -PassThru
+          if(-not $p.WaitForExit(15000)){$p.Kill();throw 'Updater did not exit after disabled startup check'}
+          if($p.ExitCode -ne 0){throw 'Updater startup failed'}
+      - name: Retain shared app test screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: officeflow-shared-startup
+          path: probe-results/*.png
+          if-no-files-found: ignore
+          retention-days: 7

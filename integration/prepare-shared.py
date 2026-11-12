@@ -4,6 +4,7 @@ import argparse, shutil
 
 def prepare(root):
     here=Path(__file__).resolve().parent
+    shutil.copyfile(here/'README.release.md',root/'README.md')
     target=root/'desktop/main.cjs'
     original=target.read_text()
     marker="// OfficeFlow native editor update bridge"

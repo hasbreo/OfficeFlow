@@ -30,6 +30,7 @@ async function identity(input,output,name,iconName){
 for(const name of ['WordFlow','CellFlow','SlideFlow','MailFlow','PDFFlow','OfficeFlowUpdater'])
  await identity(path.join(payload,'OfficeFlow.exe'),path.join(payload,name+'.exe'),name,name==='OfficeFlowUpdater'?'officeflow':name.toLowerCase());
 await fs.cp(native,path.join(payload,'collabora'),{recursive:true});
+await fs.access(path.join(payload,'collabora/LICENSE.html'));
 for(const name of ['WordFlow','CellFlow','SlideFlow']){
  const p=path.join(payload,'collabora/program',name+'.exe');await identity(p,p,name,name.toLowerCase());
 }
