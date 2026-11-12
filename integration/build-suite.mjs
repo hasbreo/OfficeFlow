@@ -41,6 +41,9 @@ await fs.rm(path.join(payload,'collabora/program/OfficeFlow.exe'),{force:true});
 // Use OfficeFlow's product identity rather than the vendor's commercial theme script.
 for(const filename of ['branding.js','branding-app.js'])
  await fs.copyFile(path.join(integration,'native/branding.js'),path.join(payload,'collabora/cool',filename));
+// Keep the final theme in sync without rebuilding the C++ engine for CSS changes.
+for(const filename of ['branding.css','branding-officeflow.svg'])
+ await fs.copyFile(path.join(integration,'../collabora/branding',filename),path.join(payload,'collabora/cool',filename));
 // These commercial vendor agreement templates do not describe our source-built distribution.
 // Keep LICENSE.html, NOTICE and all component copyright/licence notices.
 for(const filename of ['EULA.odt','EULA_en-US.rtf'])

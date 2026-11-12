@@ -4,7 +4,7 @@
   --color-primary-dark: #11664e;
   --color-primary-darker: #0c4939;
   --color-primary-lighter: #bcebd9;
-  --color-primary-text: #102b24;
+  --color-primary-text: #ffffff;
 }
 html[data-theme=dark] {
   --color-main-background: #0e1c1e;
@@ -16,7 +16,7 @@ html[data-theme=dark] {
   --color-primary-dark: #3fa985;
   --color-primary-darker: #26775e;
   --color-primary-lighter: #234d40;
-  --color-primary-text: #dcefe8;
+  --color-primary-text: #102b24;
 }
 .document-logo, #product-logo, .img-coda-app-logo {
   background-image: url('branding-officeflow.svg') !important;
