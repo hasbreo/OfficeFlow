@@ -25,7 +25,10 @@ async function identity(input,output,name,iconName){
   vi.setStringValues({lang:1033,codepage:1200},{FileDescription:name,ProductName:name,InternalName:name,OriginalFilename:path.basename(output),CompanyName:'Hasbreo'});vi.outputToResourceEntries(res.entries);
  }
  const icon=RE.Data.IconFile.from(await fs.readFile(path.join(source,'assets',iconName+'.ico')));
- RE.Resource.IconGroupEntry.replaceIconsForResource(res.entries,101,1033,icon.icons.map(i=>i.data));res.outputResource(exe);await fs.writeFile(output,Buffer.from(exe.generate()));
+ const groups=RE.Resource.IconGroupEntry.fromEntries(res.entries);
+ if(!groups.length)throw Error('Missing application icon resource: '+input);
+ for(const group of groups)RE.Resource.IconGroupEntry.replaceIconsForResource(res.entries,group.id,group.lang,icon.icons.map(i=>i.data));
+ res.outputResource(exe);await fs.writeFile(output,Buffer.from(exe.generate()));
 }
 for(const name of ['WordFlow','CellFlow','SlideFlow','MailFlow','PDFFlow','OfficeFlowUpdater'])
  await identity(path.join(payload,'OfficeFlow.exe'),path.join(payload,name+'.exe'),name,name==='OfficeFlowUpdater'?'officeflow':name.toLowerCase());

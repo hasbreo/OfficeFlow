@@ -14,7 +14,6 @@ while((Get-Date) -lt $deadline){
  $windows=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,$condition)
  foreach($window in $windows){
   if($window.Current.Name -ne 'Save As'){continue}
-  $window.SetFocus()
   [void][OfficeFlowSaveTest]::SetForegroundWindow([IntPtr]$window.Current.NativeWindowHandle)
   [System.Windows.Forms.Clipboard]::SetText($Destination)
   [System.Windows.Forms.SendKeys]::SendWait('%n')
