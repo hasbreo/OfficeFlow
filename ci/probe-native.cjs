@@ -46,8 +46,10 @@ const fixtures=[['writer','TextDocument.odt','text'],['calc','Spreadsheet.ods','
    }else if(kind==='calc'){
     for(const[cell,value]of[['A1','8'],['B1','=A1*2']]){
      await page.evaluate(cell=>app.map.sendUnoCommand('.uno:GoToCell',{ToPoint:{type:'string',value:cell}}),cell);
+     await page.waitForFunction(cell=>document.querySelector('#addressInput input')?.value===cell,cell,{timeout:15000});
      await page.evaluate(()=>app.map.focus());
      await page.keyboard.type(value);await page.keyboard.press('Enter');
+     await page.waitForFunction(next=>document.querySelector('#addressInput input')?.value===next,cell.replace(/1$/,'2'),{timeout:15000});
     }
    }else await page.evaluate(()=>app.map.insertPage());
    await page.evaluate(()=>app.map.save(false,false));

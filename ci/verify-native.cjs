@@ -47,13 +47,19 @@ async function close(child){
    else if(name==='CellFlow'){
     for(const[cell,value]of[['A1','8'],['B1','=A1*2']]){
      await page.evaluate(cell=>app.map.sendUnoCommand('.uno:GoToCell',{ToPoint:{type:'string',value:cell}}),cell);
+     // UNO navigation and Enter are asynchronous in the native engine. Wait for
+     // its address acknowledgement before typing or navigating again.
+     await page.waitForFunction(cell=>document.querySelector('#addressInput input')?.value===cell,cell,{timeout:15000});
      await page.evaluate(()=>app.map.focus());await page.keyboard.type(value);await page.keyboard.press('Enter');
+     const next=cell.replace(/1$/,'2');
+     await page.waitForFunction(next=>document.querySelector('#addressInput input')?.value===next,next,{timeout:15000});
     }
    }else await page.evaluate(()=>app.map.insertPage());
    await page.evaluate(()=>app.map.save(false,false));let good=false;const until=Date.now()+45000;
    while(Date.now()<until){
     try{const xml=await readPart(doc,part);
-     good=name==='WordFlow'?xml.includes('OfficeFlow saved document test'):name==='CellFlow'?/<f[^>]*>A1\*2<\/f>/.test(xml)&&/<v>16<\/v>/.test(xml):(xml.match(/<p:sldId\s/g)||[]).length>(before.match(/<p:sldId\s/g)||[]).length;
+     const b1=xml.match(/<c\b[^>]*\br="B1"[^>]*>[\s\S]*?<\/c>/)?.[0]||'';
+     good=name==='WordFlow'?xml.includes('OfficeFlow saved document test'):name==='CellFlow'?/<f[^>]*>A1\*2<\/f>/.test(b1)&&/<v>16<\/v>/.test(b1):(xml.match(/<p:sldId\s/g)||[]).length>(before.match(/<p:sldId\s/g)||[]).length;
      if(good)break;
     }catch{}await pause(300);
    }
@@ -84,6 +90,7 @@ async function close(child){
    assert.equal(await page.evaluate(()=>app.map._docLayer._docType),type);await close(child);
    console.log(name+' native edit, OOXML save, PDF export, normal close and reopen PASS');
   }catch(error){
+   if(page&&await page.getByText('Show technical details',{exact:true}).isVisible().catch(()=>false))await page.getByText('Show technical details',{exact:true}).click().catch(()=>{});
    if(page){await page.screenshot({path:path.join(out,name+'-failure.png')}).catch(()=>{});await fs.writeFile(path.join(out,name+'-failure.txt'),await page.locator('body').innerText()).catch(()=>{});}throw error;
   }finally{if(browser)await browser.close().catch(()=>{});if(child.exitCode===null)spawnSync('taskkill',['/PID',String(child.pid),'/T','/F'],{stdio:'ignore'});}
  }
