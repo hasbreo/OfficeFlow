@@ -12,6 +12,7 @@ public static class OfficeFlowPrintTestWindow {
  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr window,StringBuilder value,int capacity);
  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window,out uint process);
  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+ [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr window,uint message,IntPtr wParam,IntPtr lParam);
  public static IntPtr[] Dialogs(int process) {
   var result=new List<IntPtr>();
   EnumWindows((window,data)=>{
@@ -39,7 +40,9 @@ while((Get-Date) -lt $deadline){
   $cancelCondition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Cancel')
   $cancel=$window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$cancelCondition)
   if(-not $cancel){throw 'Windows Print dialog has no Cancel button'}
-  $cancel.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+  # The common print dialog exposes its Cancel label without InvokePattern.
+  # IDCANCEL is the standard dialog command and follows the same cancel path.
+  if(-not [OfficeFlowPrintTestWindow]::PostMessage($handle,0x0111,[IntPtr]2,[IntPtr]::Zero)){throw 'Could not send the print dialog Cancel command'}
   if(-not $helper.WaitForExit(15000)){throw 'Printing helper did not exit after Cancel'}
   if($helper.ExitCode -ne 0){throw "Printing helper failed: $($helper.ExitCode)"}
   Write-Host 'Installed native printing helper opened the Windows Print dialog and cancelled normally PASS'
