@@ -6,6 +6,10 @@ var brandProductName = (function () {
 })();
 var brandProductURL = 'https://hasbreo.com/officeflow/';
 window.addEventListener('load', function () {
+  // OfficeFlow supplies its own release/update experience. Do not open the
+  // vendor's presentation window automatically when a document app starts.
+  var welcome = window.L && window.L.Map && window.L.Map.Welcome;
+  if (welcome) welcome.prototype.shouldWelcomeWithSlideshow = function () {return false;};
   var observer;
   function attachIdentity() {
     var logo = document.querySelector('#document-header > a');
