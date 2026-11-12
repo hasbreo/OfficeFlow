@@ -23,7 +23,7 @@ SetCompressorDictSize 32
 !include "app-identities.nsh"
 
 Function .onInit
-  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "if (Get-Process -Name WordFlow,CellFlow,SlideFlow,MailFlow,PDFFlow -ErrorAction SilentlyContinue) { exit 42 }"'
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "if (Get-Process -Name OfficeFlow,WordFlow,CellFlow,SlideFlow,MailFlow,PDFFlow -ErrorAction SilentlyContinue) { exit 42 }"'
   Pop $0
   Pop $1
   ${If} $0 != 0

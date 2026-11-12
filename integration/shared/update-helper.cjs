@@ -2,7 +2,7 @@
 const path=require('node:path');
 const fs=require('node:fs/promises');
 const {spawnSync}=require('node:child_process');
-const documentProcesses=new Set(['wordflow.exe','cellflow.exe','slideflow.exe','mailflow.exe','pdfflow.exe']);
+const documentProcesses=new Set(['officeflow.exe','wordflow.exe','cellflow.exe','slideflow.exe','mailflow.exe','pdfflow.exe']);
 function runningApps(run=spawnSync){
  const r=run('tasklist.exe',['/FO','CSV','/NH'],{encoding:'utf8',windowsHide:true,timeout:10000});
  if(r.error||r.status!==0)throw Error('Cannot verify that OfficeFlow programs are closed. Close them before running the installer.');
