@@ -13,6 +13,10 @@ public static class OfficeFlowPrintTestWindow {
  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window,out uint process);
  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr window,uint message,IntPtr wParam,IntPtr lParam);
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern IntPtr OpenProcess(uint access,bool inherit,int process);
+ [DllImport("kernel32.dll")] public static extern uint WaitForSingleObject(IntPtr handle,uint milliseconds);
+ [DllImport("kernel32.dll")] public static extern bool GetExitCodeProcess(IntPtr handle,out uint code);
+ [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr handle);
  public static IntPtr[] Dialogs(int process) {
   var result=new List<IntPtr>();
   EnumWindows((window,data)=>{
@@ -33,6 +37,10 @@ while((Get-Date) -lt $deadline){
  Start-Sleep -Milliseconds 200
 }
 if(-not $helper){throw 'The native editor did not launch its installed printing helper'}
+# Retain an OS process handle before cancelling; Get-Process can lose ExitCode
+# when the externally launched process exits before its handle is cached.
+$helperHandle=[OfficeFlowPrintTestWindow]::OpenProcess(0x00101000,$false,$helper.Id)
+if($helperHandle -eq [IntPtr]::Zero){throw 'Could not retain the printing helper process handle'}
 while((Get-Date) -lt $deadline){
  foreach($handle in [OfficeFlowPrintTestWindow]::Dialogs($helper.Id)){
   $window=[System.Windows.Automation.AutomationElement]::FromHandle($handle)
@@ -43,8 +51,11 @@ while((Get-Date) -lt $deadline){
   # The common print dialog exposes its Cancel label without InvokePattern.
   # IDCANCEL is the standard dialog command and follows the same cancel path.
   if(-not [OfficeFlowPrintTestWindow]::PostMessage($handle,0x0111,[IntPtr]2,[IntPtr]::Zero)){throw 'Could not send the print dialog Cancel command'}
-  if(-not $helper.WaitForExit(15000)){throw 'Printing helper did not exit after Cancel'}
-  if($helper.ExitCode -ne 0){throw "Printing helper failed: $($helper.ExitCode)"}
+  if([OfficeFlowPrintTestWindow]::WaitForSingleObject($helperHandle,15000) -ne 0){throw 'Printing helper did not exit after Cancel'}
+  [uint32]$result=0
+  if(-not [OfficeFlowPrintTestWindow]::GetExitCodeProcess($helperHandle,[ref]$result)){throw 'Could not read printing helper exit code'}
+  [void][OfficeFlowPrintTestWindow]::CloseHandle($helperHandle)
+  if($result -ne 0){throw "Printing helper failed: $result"}
   Write-Host 'Installed native printing helper opened the Windows Print dialog and cancelled normally PASS'
   exit 0
  }
