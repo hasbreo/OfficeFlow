@@ -82,6 +82,12 @@ async function close(child){
    assert(pdfBytes&&pdfBytes.length>1000&&pdfBytes.subarray(0,5).toString()==='%PDF-',name+' native PDF export failed');
    if(picker.exitCode===null)await new Promise(resolve=>picker.once('exit',resolve));
    assert.equal(picker.exitCode,0,'Native PDF save dialog did not complete');
+   if(process.argv.includes('--expect-editable')){
+    const printer=spawn('powershell.exe',['-NoProfile','-NonInteractive','-File',path.join(__dirname,'cancel-native-print.ps1'),'-EditorProcessId',String(child.pid)],{stdio:'inherit'});
+    await page.evaluate(()=>window.postMobileMessage('PRINT'));
+    if(printer.exitCode===null)await new Promise(resolve=>printer.once('exit',resolve));
+    assert.equal(printer.exitCode,0,'Installed native printing dialog failed');
+   }
    await page.screenshot({path:path.join(out,name+'.png')});await fs.writeFile(path.join(out,name+'.txt'),await page.locator('body').innerText());
    await close(child);await browser.close();browser=null;
    // Reopen the bytes just written using the same real native application.
