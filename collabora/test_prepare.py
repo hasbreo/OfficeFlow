@@ -44,6 +44,15 @@ class NativeIdentityPatch(unittest.TestCase):
         self.assertIn('$(if $(WSL),',patched)
         with self.assertRaises(ValueError): module.patch_nasm_paths('unexpected rule')
 
+    def test_branding_matches_upstream_copy_contract(self):
+        # Upstream unconditionally copies images/*.svg and this toolbar asset.
+        brand = root / 'branding'
+        self.assertTrue((brand / 'images/toolbar-bg-logo.svg').is_file())
+        self.assertTrue(list((brand / 'images').glob('*.svg')))
+        css = (brand / 'branding.css').read_text()
+        self.assertIn("url('branding-officeflow.svg')", css)
+        self.assertTrue((brand / 'branding-officeflow.svg').is_file())
+
     def test_blank_packages_are_valid_office_files(self):
         import zipfile
         for filename, part in [('TextDocument.docx','word/document.xml'),('Spreadsheet.xlsx','xl/workbook.xml'),('Presentation.pptx','ppt/presentation.xml')]:

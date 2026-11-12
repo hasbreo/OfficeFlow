@@ -36,9 +36,41 @@ jobs:
           ./collabora/ci-dependencies.ps1
           "MSYS2_ROOT=${{ steps.msys.outputs.msys2-location }}" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Get-PSDrive C | Format-List Name,Free,Used
-      - name: Build engine and native desktop hosts
+      - name: Restore the completed pinned engine
+        id: engine-cache
+        uses: actions/cache/restore@v4
+        with:
+          key: officeflow-engine-win-vs2026-573fd7c6-release-enUS-nasm1
+          path: |
+            C:/of-build/engine
+            !C:/of-build/engine/workdir/CxxObject
+            !C:/of-build/engine/workdir/CObject
+            !C:/of-build/engine/workdir/AsmObject
+            C:/of-build/Makefile
+            C:/of-build/coda-config.mk
+            C:/of-build/autogen.input
+            C:/of-build/.officeflow-engine-complete
+      - name: Build the native engine
         shell: bash
-        run: bash collabora/ci-build.sh
+        run: bash collabora/ci-build.sh engine
+      - name: Save completed engine before frontend compilation
+        if: steps.engine-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: officeflow-engine-win-vs2026-573fd7c6-release-enUS-nasm1
+          path: |
+            C:/of-build/engine
+            !C:/of-build/engine/workdir/CxxObject
+            !C:/of-build/engine/workdir/CObject
+            !C:/of-build/engine/workdir/AsmObject
+            C:/of-build/Makefile
+            C:/of-build/coda-config.mk
+            C:/of-build/autogen.input
+            C:/of-build/.officeflow-engine-complete
+      - name: Build the native desktop hosts and full interface
+        shell: bash
+        run: bash collabora/ci-build.sh desktop
       - name: Retain configuration and build logs
         if: always()
         uses: actions/upload-artifact@v4
