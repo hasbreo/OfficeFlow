@@ -32,8 +32,30 @@ Function .onInit
   ${EndIf}
 FunctionEnd
 
+Function WebViewPresent
+  ReadRegStr $0 HKCU "Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
+  ${If} $0 == ""
+  ${OrIf} $0 == "0.0.0.0"
+    ReadRegStr $0 HKLM "SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
+  ${EndIf}
+FunctionEnd
+
 Section "OfficeFlow apps and shared components (required)" Core
   SectionIn RO
+  Call WebViewPresent
+  ${If} $0 == ""
+  ${OrIf} $0 == "0.0.0.0"
+    InitPluginsDir
+    File "/oname=$PLUGINSDIR\MicrosoftEdgeWebview2Setup.exe" "${WEBVIEW_SETUP}"
+    DetailPrint "Installing Microsoft WebView2..."
+    ExecWait '$\"$PLUGINSDIR\MicrosoftEdgeWebview2Setup.exe$\" /silent /install' $1
+    Call WebViewPresent
+    ${If} $0 == ""
+    ${OrIf} $0 == "0.0.0.0"
+      MessageBox MB_OK|MB_ICONINFORMATION "OfficeFlow needs Microsoft WebView2. Connect to the internet, then run Setup again."
+      Abort
+    ${EndIf}
+  ${EndIf}
   SetOutPath "$INSTDIR"
   File /r /x WordFlow.exe /x CellFlow.exe /x SlideFlow.exe /x MailFlow.exe /x PDFFlow.exe /x OfficeFlowUpdater.exe "${PAYLOAD}/*"
   SetOutPath "$INSTDIR\collabora\program"

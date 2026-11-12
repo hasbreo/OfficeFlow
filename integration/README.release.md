@@ -14,6 +14,8 @@ The three document apps now use the full local Collabora desktop engine and inte
 
 Close OfficeFlow programs and run `OfficeFlow-Setup-0.5.0.exe`. Install over the existing location to update. Each Start-menu shortcut opens its own app. Older pinned shortcuts are forwarded to the matching native editor.
 
+Windows 10/11, 64-bit. Setup installs Microsoft WebView2 if it is missing; that dependency installation needs internet access.
+
 Use **File → Check for updates** in a document app, or the existing update command in MailFlow and PDFFlow. Startup checks respect the shared automatic-update preference. An update is offered for installation; open apps must be closed first. Downloads are checked against the publisher's existing release-signing key and SHA-256.
 
 The installer preserves documents, downloaded mail and user profiles. Uninstall removes program files and registered shortcuts, while keeping user data. The installer is not Authenticode-signed.

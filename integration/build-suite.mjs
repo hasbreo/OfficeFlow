@@ -46,6 +46,12 @@ let cleanup='';for(const [name,ext] of [['WordFlow','docx'],['CellFlow','xlsx'],
  if(ext)cleanup+=`DeleteRegKey HKCU "Software\\Classes\\OfficeFlow.${ext}"\nDeleteRegValue HKCU "Software\\Classes\\.${ext}\\OpenWithProgids" "OfficeFlow.${ext}"\n`;
 }
 await fs.writeFile('scripts/uninstall-shortcuts.nsh',cleanup);
+const webview=path.join(source,'build-deps/MicrosoftEdgeWebview2Setup.exe');
+run('powershell.exe',['-NoProfile','-NonInteractive','-File',path.join(integration,'fetch-webview-runtime.ps1'),'-Destination',webview]);
+const installerScript=path.join(source,'scripts/native-installer.mjs');
+let installerCode=await fs.readFile(installerScript,'utf8');
+installerCode=installerCode.replace("'scripts/installer.nsi'","'-DWEBVIEW_SETUP='+process.env.OFFICEFLOW_WEBVIEW_SETUP,'scripts/installer.nsi'");
+await fs.writeFile(installerScript,installerCode);process.env.OFFICEFLOW_WEBVIEW_SETUP=webview;
 const compiler=await require('app-builder-lib/out/toolsets/windows').getMakeNsisPath('0.0.0');Object.assign(process.env,compiler.env);
 process.env.MAKENSIS=compiler.path;process.env.OFFICEFLOW_PAYLOAD=payload;process.env.OFFICEFLOW_INSTALLER=path.join(source,'release-0.5/OfficeFlow-Setup-'+version+'.exe');
 await import(pathToFileURL(path.join(source,'scripts/native-installer.mjs')));

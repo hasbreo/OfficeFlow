@@ -6,7 +6,7 @@ shared=Path(sys.argv[1]).resolve(); repo=Path(__file__).resolve().parent.parent
 version=json.loads((shared/'package.json').read_text())['version']
 output=shared.parent/f'OfficeFlow-{version}-source.zip'
 def excluded(relative):
-    return any(p in {'node_modules','.git','dist','test-results','playwright-report','__pycache__'} or p.startswith('release') for p in relative.parts) or relative.suffix in {'.pem','.key'}
+    return any(p in {'node_modules','.git','dist','test-results','playwright-report','__pycache__','build-deps'} or p.startswith('release') for p in relative.parts) or relative.suffix in {'.pem','.key'}
 with ZipFile(output,'w',ZIP_DEFLATED) as archive:
     for source,prefix in [(shared,Path('OfficeFlow')),(repo,Path('OfficeFlow/native-build'))]:
         for p in source.rglob('*'):
