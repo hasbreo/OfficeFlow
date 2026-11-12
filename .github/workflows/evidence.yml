@@ -9,7 +9,7 @@ permissions:
   actions: read
 jobs:
   evidence:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.conclusion == 'success' || github.event.workflow_run.conclusion == 'failure'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -25,12 +25,14 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_RUN: ${{ github.event.workflow_run.id }}
           SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          SOURCE_RESULT: ${{ github.event.workflow_run.conclusion }}
+          SOURCE_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: |
           set -euo pipefail
           mkdir evidence-repository
           find verification -maxdepth 1 -type f \( -name '*.png' -o -name '*.txt' \) -exec cp {} evidence-repository/ \;
-          test -s evidence-repository/WordFlow-new.png
-          printf 'OfficeFlow synthetic Windows verification\nSource run: %s\nSource commit: %s\nNo user documents, accounts or profiles are included.\n' "$SOURCE_RUN" "$SOURCE_SHA" > evidence-repository/README.txt
+          test "$(find evidence-repository -name '*.png' | wc -l)" -gt 0
+          printf 'OfficeFlow synthetic Windows verification\nSource run: %s\nSource commit: %s\nResult: %s\nNo user documents, accounts or profiles are included.\n' "$SOURCE_RUN" "$SOURCE_SHA" "$SOURCE_RESULT" > evidence-repository/README.txt
           cd evidence-repository
           git init
           git config user.name 'OfficeFlow verification'
@@ -39,4 +41,4 @@ jobs:
           git commit -m "OfficeFlow synthetic Windows verification $SOURCE_RUN [skip ci]"
           git remote add origin https://github.com/hasbreo/OfficeFlow.git
           gh auth setup-git --hostname github.com
-          git push origin HEAD:refs/heads/verification-0.5.0-$SOURCE_RUN
+          git push origin HEAD:refs/heads/verification-0.5.0-$SOURCE_RUN-$SOURCE_ATTEMPT
