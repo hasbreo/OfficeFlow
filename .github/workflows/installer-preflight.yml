@@ -1,0 +1,52 @@
+name: Verify installer assembly before the source build completes
+on:
+  push:
+    paths: ['.github/workflows/installer-preflight.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  preflight:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Obtain official runtime for private installer testing only
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Stop'
+          $zip=Join-Path $env:RUNNER_TEMP 'collabora-fixture.zip'
+          $payload=Join-Path $env:RUNNER_TEMP 'collabora-fixture'
+          Invoke-WebRequest 'https://www.collaboraoffice.com/downloads/Collabora-Office-Windows-Snapshot/CollaboraOffice-Winx64-26.04.6.1-122.zip' -OutFile $zip
+          if((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne '0efb6e08af581386e7e3d983b0347f9291c223eab2f40a3ae8ba98271bf5ae7e'){throw 'Fixture checksum mismatch'}
+          Expand-Archive $zip $payload
+          foreach($name in @('WordFlow','CellFlow','SlideFlow')){Copy-Item "$payload/program/Collabora Office Preview.exe" "$payload/program/$name.exe"}
+          "OFFICEFLOW_FIXTURE=$payload" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Obtain checksum-pinned shared source
+        shell: pwsh
+        run: ./integration/fetch-shared.ps1
+      - name: Assemble the installer using the exact release packaging code
+        shell: pwsh
+        run: |
+          python integration/prepare-shared.py "$env:OFFICEFLOW_SHARED"
+          Set-Location $env:OFFICEFLOW_SHARED
+          npm ci --no-audit --no-fund
+          if($LASTEXITCODE -ne 0){throw 'Dependency installation failed'}
+          Set-Location $env:GITHUB_WORKSPACE
+          node integration/build-suite.mjs "$env:OFFICEFLOW_SHARED" "$env:OFFICEFLOW_FIXTURE"
+          if($LASTEXITCODE -ne 0){throw 'Installer assembly failed'}
+      - name: Test actual upgrade and independent shortcut identities
+        shell: pwsh
+        run: ./ci/verify-installer.ps1 -Installer "$env:OFFICEFLOW_SHARED/release-0.5/OfficeFlow-Setup-0.5.0.exe"
+      - name: Install shared app test driver
+        run: npm install --no-save --package-lock=false playwright@1.65.0
+      - name: Test installed MailFlow and PDFFlow
+        run: node ci/verify-shared.cjs "$env:OFFICEFLOW_INSTALLED"
+      - name: Verify uninstall and rollback retain mail
+        shell: pwsh
+        run: ./ci/verify-uninstall.ps1
+      # The official fixture and this test installer are never uploaded or released.
