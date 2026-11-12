@@ -1,0 +1,119 @@
+name: Checkpointed native build stage
+on:
+  workflow_call:
+    inputs:
+      stage_name:
+        type: string
+        required: true
+      resume_key:
+        type: string
+        default: ''
+      phase:
+        type: string
+        default: engine
+    outputs:
+      complete:
+        value: ${{ jobs.stage.outputs.complete }}
+      cache_key:
+        value: ${{ jobs.stage.outputs.cache_key }}
+permissions:
+  contents: read
+jobs:
+  stage:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 300
+    outputs:
+      complete: ${{ steps.state.outputs.complete }}
+      cache_key: officeflow-checkpoint-${{ github.run_id }}-${{ inputs.stage_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: msys2/setup-msys2@v2
+        id: msys
+        with:
+          msystem: MSYS
+          update: true
+          install: autoconf automake libtool m4 make gcc bison flex gperf nasm zip unzip gettext gettext-devel patch pkgconf python python-lxml python-pip perl
+      - shell: msys2 {0}
+        run: python3 -m pip install --break-system-packages polib
+      - shell: pwsh
+        run: |
+          ./collabora/ci-dependencies.ps1
+          "MSYS2_ROOT=${{ steps.msys.outputs.msys2-location }}" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Restore the previous source and object checkpoint
+        if: inputs.resume_key != ''
+        uses: actions/cache/restore@v4
+        with:
+          key: ${{ inputs.resume_key }}
+          fail-on-cache-miss: true
+          path: |
+            C:/of-source
+            C:/of-build
+            C:/of-downloads
+      - name: Reuse a completed engine when available
+        if: inputs.resume_key == ''
+        uses: actions/cache/restore@v4
+        with:
+          key: officeflow-engine-win-vs2026-573fd7c6-release-enUS-nasm1
+          path: |
+            C:/of-build/engine
+            !C:/of-build/engine/workdir/CxxObject
+            !C:/of-build/engine/workdir/CObject
+            !C:/of-build/engine/workdir/AsmObject
+            C:/of-build/Makefile
+            C:/of-build/coda-config.mk
+            C:/of-build/autogen.input
+            C:/of-build/.officeflow-engine-complete
+      - name: Compile the next engine segment
+        if: inputs.phase == 'engine'
+        id: engine
+        continue-on-error: true
+        timeout-minutes: 240
+        shell: bash
+        run: bash integration/checkpoint-engine.sh
+      - name: Check and clean interrupted intermediate files
+        if: always() && inputs.phase == 'engine'
+        id: state
+        shell: pwsh
+        run: ./integration/checkpoint-engine-state.ps1
+      - name: Retain source, generated headers and completed objects
+        if: always() && inputs.phase == 'engine'
+        uses: actions/cache/save@v4
+        with:
+          key: officeflow-checkpoint-${{ github.run_id }}-${{ inputs.stage_name }}
+          path: |
+            C:/of-source
+            C:/of-build
+            C:/of-downloads
+      - name: Report a compiler failure
+        if: inputs.phase == 'engine' && steps.state.outputs.result != '-1' && steps.state.outputs.result != '0' && steps.state.outputs.result != '130' && steps.state.outputs.result != '143'
+        shell: pwsh
+        run: throw 'The compiler reported an error; its checkpoint and logs are retained for repair.'
+      - name: Rebuild the interface and native hosts from the completed engine
+        if: inputs.phase == 'desktop'
+        shell: bash
+        run: |
+          test -s /c/of-build/.officeflow-engine-complete
+          git -C /c/of-source restore -- windows/coda/CODA/CODA.cpp browser/src/control/Control.BackstageView.ts browser/src/control/backstage/Types.ts
+          python collabora/prepare.py /c/of-source
+          bash collabora/ci-build.sh desktop
+      - name: Retain native desktop payload
+        if: inputs.phase == 'desktop'
+        uses: actions/upload-artifact@v4
+        with:
+          name: officeflow-native-development
+          path: C:/of-build/online/windows/coda/x64/Release/
+          retention-days: 7
+      - name: Retain build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-checkpoint-logs-${{ inputs.stage_name }}
+          path: |
+            C:/of-build/*.log
+            C:/of-build/engine/config.log
+            C:/of-build/online/config.log
+          if-no-files-found: ignore
+          retention-days: 7

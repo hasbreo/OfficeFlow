@@ -1,0 +1,39 @@
+name: Build Collabora native editors with checkpoints
+on:
+  workflow_run:
+    workflows: ['Build Collabora native editors']
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      resume_key:
+        description: Existing source/object checkpoint key, if resuming a repaired build
+        required: false
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: collabora-checkpoint-build
+  cancel-in-progress: false
+jobs:
+  engine-one:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'timed_out'
+    uses: ./.github/workflows/checkpoint-engine-stage.yml
+    with:
+      stage_name: engine-one
+      resume_key: ${{ inputs.resume_key || '' }}
+  engine-two:
+    needs: engine-one
+    if: needs.engine-one.outputs.complete != 'true'
+    uses: ./.github/workflows/checkpoint-engine-stage.yml
+    with:
+      stage_name: engine-two
+      resume_key: ${{ needs.engine-one.outputs.cache_key }}
+  desktop:
+    needs: [engine-one, engine-two]
+    if: always() && needs.engine-one.result == 'success' && (needs.engine-two.result == 'success' || needs.engine-two.result == 'skipped')
+    uses: ./.github/workflows/checkpoint-engine-stage.yml
+    with:
+      stage_name: desktop
+      phase: desktop
+      resume_key: ${{ needs.engine-two.outputs.cache_key || needs.engine-one.outputs.cache_key }}

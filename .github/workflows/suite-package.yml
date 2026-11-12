@@ -1,7 +1,7 @@
 name: Package and verify OfficeFlow suite
 on:
   workflow_run:
-    workflows: ['Build Collabora native editors']
+    workflows: ['Build Collabora native editors', 'Build Collabora native editors with checkpoints']
     types: [completed]
     branches: [main]
   workflow_dispatch:
