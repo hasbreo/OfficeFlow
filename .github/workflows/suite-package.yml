@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 90
     env:
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
-      OFFICEFLOW_CANDIDATE: ${{ runner.temp }}/officeflow-candidate
+      OFFICEFLOW_CANDIDATE: ${{ github.workspace }}/officeflow-candidate
     steps:
       - uses: actions/checkout@v4
         with:
