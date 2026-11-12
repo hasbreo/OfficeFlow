@@ -38,6 +38,14 @@ for(const name of ['WordFlow','CellFlow','SlideFlow']){
  const p=path.join(payload,'collabora/program',name+'.exe');await identity(p,p,name,name.toLowerCase());
 }
 await fs.rm(path.join(payload,'collabora/program/OfficeFlow.exe'),{force:true});
+// Use OfficeFlow's product identity rather than the vendor's commercial theme script.
+for(const filename of ['branding.js','branding-app.js'])
+ await fs.copyFile(path.join(integration,'native/branding.js'),path.join(payload,'collabora/cool',filename));
+// These commercial vendor agreement templates do not describe our source-built distribution.
+// Keep LICENSE.html, NOTICE and all component copyright/licence notices.
+for(const filename of ['EULA.odt','EULA_en-US.rtf'])
+ await fs.rm(path.join(payload,'collabora',filename),{force:true});
+
 run('pwsh.exe',['-NoProfile','-NonInteractive','-File',path.join(integration,'build-print-helper.ps1'),'-Destination',path.join(payload,'collabora')]);
 await fs.writeFile(path.join(payload,'collabora/OFFICEFLOW-SOURCE.txt'),'OfficeFlow document editors use Collabora Online / LibreOffice technology.\nCorresponding pinned source and modifications: https://github.com/hasbreo/OfficeFlow\nComponent licences and attribution are retained in this directory.\n');
 // Store Electron once in NSIS and reconstruct its six process identities.

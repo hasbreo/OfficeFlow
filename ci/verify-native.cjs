@@ -37,6 +37,7 @@ async function close(child){
    if(!upstream)assert.equal(new URL(page.url()).searchParams.get('officeflowApp'),name);
    await page.waitForFunction(()=>globalThis.app?.map?._docLayer?._docType,null,{timeout:90000});
    assert.equal(await page.evaluate(()=>app.map._docLayer._docType),type);
+   if(process.argv.includes('--expect-editable'))assert.equal(await page.evaluate(()=>globalThis.brandProductName),name,'Installed UI product identity differs');
    if(!process.argv.includes('--expect-editable')&&await page.getByText('Viewing',{exact:true}).isVisible()){
     await page.getByText('Viewing',{exact:true}).click();await page.getByText('Editing Mode',{exact:true}).click();
    }
