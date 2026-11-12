@@ -10,7 +10,7 @@ on:
         description: Successful native source-build run ID
         required: true
 permissions:
-  contents: read
+  contents: write
   actions: read
 jobs:
   package:
@@ -67,16 +67,22 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: officeflow-suite-test-evidence
-          path: probe-results/
+          path: |
+            probe-results/*.png
+            probe-results/*.txt
+            probe-results/*.pdf
           if-no-files-found: ignore
           retention-days: 7
-      - name: Retain verified candidate installer and source
-        uses: actions/upload-artifact@v4
-        with:
-          name: officeflow-0.5.0-verified-candidate
-          path: |
-            ${{ env.OFFICEFLOW_SHARED }}/release-0.5/OfficeFlow-Setup-0.5.0.exe
-            ${{ runner.temp }}/officeflow-shared/OfficeFlow-0.5.0-source.zip
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 7
+      - name: Publish the verified candidate assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $setup=Join-Path $env:OFFICEFLOW_SHARED 'release-0.5/OfficeFlow-Setup-0.5.0.exe'
+          $source=Join-Path $env:RUNNER_TEMP 'officeflow-shared/OfficeFlow-0.5.0-source.zip'
+          $sum=Join-Path $env:RUNNER_TEMP 'SHA256SUMS.txt'
+          @($setup,$source) | ForEach-Object { (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant()+'  '+(Split-Path $_ -Leaf) } | Set-Content $sum -Encoding utf8NoBOM
+          $commit=git rev-parse HEAD
+          $tag="candidate-0.5.0-$env:GITHUB_RUN_ID"
+          gh release create $tag $setup $source $sum --repo hasbreo/OfficeFlow --target $commit --title 'OfficeFlow 0.5.0 — verified Windows candidate' --prerelease --latest=false --notes 'Source-built Collabora document apps with the shared MailFlow/PDFFlow installer. Native edit/save/reopen, PDF export, independent shortcuts, Windows identities, upgrade and mail retention checks passed. Candidate assets are available here before promotion to the signed Hasbreo.com updater feed.'
+          if($LASTEXITCODE -ne 0){throw 'Verified candidate asset publication failed'}
