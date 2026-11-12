@@ -1,30 +1,52 @@
-# Native Collabora migration — development only
+# Native Windows build
 
-The production OfficeFlow 0.4.3 remains unchanged. This is a migration checkpoint,
-not an installable release. No claim of Windows compilation or UI validation.
+The supported build recipe is `.github/workflows/collabora-build.yml`, using a
+Windows VS 2026 runner. The full engine compiled successfully in run
+[43141296679](https://github.com/hasbreo/OfficeFlow/actions/runs/43141296679).
 
-Use the exact repository and commit in upstream.lock.json. The corresponding
-CODA.cpp and project file are retained under upstream-reference for review;
-they retain their upstream licensing. prepare.py changes native identities only.
-It does not replace the editor, remove any ribbon commands, change file formats,
-or modify the document model. Renaming the built hosts selects WordFlow,
-CellFlow or SlideFlow; upstream's appName-based profile and taskbar ID isolate them.
+The exact source repository and commit are recorded in `upstream.lock.json`.
+`prepare.py` checks that revision and refuses unexpected source edits. It patches
+native identities, independent document-family start pages, blank Office file
+templates, editable local files, signed update commands and the native NASM path
+rule. Full editor commands and the document model remain upstream.
 
-## Required native build environment
+## Reproduce the native payload
 
-Official guide: https://www.collaboraoffice.org/post/build-co-windows/
+Use **Build Collabora native editors → Run workflow** in GitHub Actions. The
+workflow installs checksum-verified native dependencies, sets up MSYS2, validates
+the source patches and runs these commands from the OfficeFlow repository:
 
-1. Use a Windows x64 machine with VS 2026 Desktop C++/.NET workloads, ClangCL,
-   Git Bash, MSYS2 and the dependencies listed by windows/.config in the source.
-2. Clone the repository in upstream.lock.json and checkout its exact commit.
-3. Build engine/ with --with-distro=CODAWindows and the correct local tool paths.
-   Use a Release engine for the Release native host; follow the official guide.
-4. In a VS developer environment exposed to Git Bash, run:
-   `bash collabora/build-windows.sh CHECKOUT STAGING_DIRECTORY`.
+```bash
+bash collabora/ci-build.sh engine
+bash collabora/ci-build.sh desktop
+```
 
-The script deliberately refuses Linux. Wine or a repackaged upstream preview is
-not a replacement for this native build and its validation.
+For a local Windows build, reproduce the workflow's VS 2026 Desktop C++/.NET,
+ClangCL, Git Bash and MSYS2 environment first. The recipe deliberately uses fixed
+paths `C:/of-source`, `C:/of-build`, `C:/of-tools` and `C:/of-downloads`; the
+dependency setup is in `collabora/ci-dependencies.ps1`. Keep those directories
+dedicated to this build. `MSYS2_ROOT` must identify the installed MSYS2 tree.
+The upstream [Windows build guide](https://www.collaboraoffice.org/post/build-co-windows/)
+explains the underlying toolchain.
 
-The first native build is only a development payload. Application-specific
-start/new/open flows, icons, OfficeFlow updater integration, legal/source
-distribution and the shared installer remain release gates (STATUS.md).
+The first engine build takes several hours. A successful engine is cached with
+its SDK before the interface and native hosts compile. Subsequent builds can
+reuse it. `native-checkpoint.yml` provides bounded stages with saved source and
+objects if a hosted runner reaches its time limit.
+
+The `officeflow-native-development` artifact contains the complete native
+payload. Its name identifies a build input, not a finished installer.
+
+## Assemble and verify the installer
+
+The successful native workflow triggers **Package and verify OfficeFlow suite**.
+That workflow can also be dispatched with a successful native run ID. It obtains
+the checksum-pinned shared source, applies integration, builds the installer and
+runs the release gates in `STATUS.md`. Only passing candidates are published as
+GitHub prerelease assets. Promotion to Hasbreo.com's signed updater feed follows
+verification of those exact assets.
+
+The source archive includes the shared application's source, its third-party
+notices and corresponding MuPDF source, together with this exact native build
+recipe. The native upstream source remains available at the pinned public
+revision. Private release keys are excluded.

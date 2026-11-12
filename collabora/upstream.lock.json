@@ -1,6 +1,5 @@
 {
   "repository": "https://github.com/CollaboraOnline/online.mirror.git",
   "commit": "573fd7c6311e3b457906b19c194c5ff1c51f0df8",
-  "target": "windows/coda",
-  "status": "source migration; native Windows build not validated"
+  "target": "windows/coda"
 }

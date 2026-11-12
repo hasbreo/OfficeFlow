@@ -1,42 +1,44 @@
-# Migration status — 12 November 2026
+# Native migration and release verification
 
-## Completed
+WordFlow, CellFlow and SlideFlow use the full source-built native Collabora
+engine. Their executable names select independent Windows titles, taskbar IDs,
+profiles and document-family start pages. New files use DOCX, XLSX and PPTX.
+OfficeFlow branding leaves the complete native interface and commands intact.
 
-- Recovered production OfficeFlow 0.4.3 source; MailFlow and PDFFlow untouched.
-- Inspected official Collabora 26.04.6.1-122 Windows preview, including its
-  bundled native engine, browser UI, templates, licence and native host layout.
-- Verified source support for local desktop editing, native printing and a
-  complete Collabora interface. Did not run the Windows preview on this host.
-- Pinned current Collabora source and prepared a guarded native-host identity
-  patch for WordFlow, CellFlow and SlideFlow.
-- Added Windows build entry point; source-level patch tests are distinct from
-  compilation and application tests.
+MailFlow and PDFFlow retain the existing shared application, downloaded archives
+and profiles. Native document apps invoke the same signed update service through
+a fixed installed helper. The updater requires open apps to be closed by the
+user before installing.
 
-## Initial blocker (resolved by GitHub Actions)
+The native engine build passed on 12 November 2026. Build and test evidence is
+recorded in the repository's GitHub Actions runs. A complete engine cache allows
+interface and installer fixes without repeating its compilation.
 
-This executor is Linux with no native Windows/Visual Studio build runner.
-The official Windows host and engine require native MSBuild/ClangCL plus MSYS2.
-The initial workspace had no Windows runner. GitHub Actions subsequently passed
-the VS 2026/ClangCL preflight, and the first native build is now configured in
-this repository. A complete custom Windows installer has NOT been built or published.
+## Mandatory release gates
 
-## Work required before release
+`.github/workflows/suite-package.yml` runs these checks against the actual
+source-built Windows payload and installed suite:
 
-- Obtain Windows build execution; build pinned engine and native host.
-- Give each app its own start page and New/Open document type flows. The current
-  development patch fixes identities only; upstream starter remains generic.
-- Apply mint theme with full native controls retained, including dialogs,
-  contextual menus and accessibility. Test both light and dark appearance.
-- Integrate manual/startup signed update checks with native apps, using the
-  existing production verification key (private signing key is not in source).
-- Stage native payload beside unchanged MailFlow/PDFFlow; update shared installer
-  shortcuts/associations and test upgrade, uninstall and rollback.
-- Audit exact component licences/branding; publish corresponding modified source.
-- Test real Word-like document layout, images/tables/styles, XLSX formulas,
-  references/filtering/charts, slide creation/layouts/objects/presentation mode,
-  save/reopen/export PDF and Windows printer dialogs on the actual native apps.
-- Confirm old document/mail/profile data survives upgrade; no migration of mail
-  to a new profile, no opening originals for destructive conversion.
+1. Edit and save real DOCX, XLSX and PPTX files, export PDFs, close normally and
+   reopen the resulting files. Rich fixtures check document tables, images and
+   headers; exact cell references, cross-sheet calculations and charts; and
+   presentation images and slide creation.
+2. Assemble one installer with independent native document executables and the
+   shared MailFlow/PDFFlow executables, product identities and icons.
+3. Install over OfficeFlow 0.4.3 in a path containing spaces and Unicode. Check
+   shortcut targets, executable metadata and retention of a synthetic local email.
+4. Start each document app without arguments, check its own start page, create
+   the correct blank Office format, verify ready-to-edit mode and close normally.
+5. Repeat native edit/save/PDF/close/reopen checks after installation. Open and
+   cancel the actual Windows Print dialog through the bundled printing helper.
+6. Start installed MailFlow and PDFFlow, then verify uninstall and rollback keep
+   local user data. Package corresponding source without keys, profiles or caches.
 
-Do not publish a release feed entry until these checks are complete. The
-downloaded upstream snapshot is an inspection fixture, not an OfficeFlow build.
+Only a passing workflow publishes verified candidate assets. Hasbreo's signed
+release information is promoted after inspecting those exact assets. The
+official vendor preview is an isolated test fixture and is never shipped as
+OfficeFlow.
+
+Physical printers and arbitrary Microsoft Office documents require local
+testing. Fonts, macros, advanced layouts and animations can behave differently
+from Microsoft Office; the migration does not promise perfect format fidelity.
