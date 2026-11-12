@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 /* OfficeFlow product identity. Component attribution remains in LICENSE.html. */
 var brandProductName = (function () {
   var name = new URLSearchParams(window.location.search).get('officeflowApp');
