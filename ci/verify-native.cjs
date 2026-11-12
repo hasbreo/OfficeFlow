@@ -35,12 +35,12 @@ async function close(child){
   try{
    ({browser,page}=await connect(child,port));
    if(!upstream)assert.equal(new URL(page.url()).searchParams.get('officeflowApp'),name);
-   await page.waitForFunction(()=>globalThis.app?.map?._docLayer?._docType,{timeout:90000});
+   await page.waitForFunction(()=>globalThis.app?.map?._docLayer?._docType,null,{timeout:90000});
    assert.equal(await page.evaluate(()=>app.map._docLayer._docType),type);
    if(await page.getByText('Viewing',{exact:true}).isVisible()){
     await page.getByText('Viewing',{exact:true}).click();await page.getByText('Editing Mode',{exact:true}).click();
    }
-   await page.waitForFunction(()=>app.map.isEditMode(),{timeout:30000});
+   await page.waitForFunction(()=>app.map.isEditMode(),null,{timeout:30000});
    const before=await readPart(doc,part);
    if(name==='WordFlow'){await page.evaluate(()=>app.map.focus());await page.keyboard.type('OfficeFlow saved document test');}
    else if(name==='CellFlow'){
@@ -79,7 +79,7 @@ async function close(child){
    await close(child);await browser.close();browser=null;
    // Reopen the bytes just written using the same real native application.
    child=launch();({browser,page}=await connect(child,port));
-   await page.waitForFunction(()=>globalThis.app?.map?._docLayer?._docType,{timeout:90000});
+   await page.waitForFunction(()=>globalThis.app?.map?._docLayer?._docType,null,{timeout:90000});
    assert.equal(await page.evaluate(()=>app.map._docLayer._docType),type);await close(child);
    console.log(name+' native edit, OOXML save, PDF export, normal close and reopen PASS');
   }catch(error){
