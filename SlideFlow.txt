@@ -1,0 +1,112 @@
+File
+Home
+Insert
+Design
+Transition
+Slide Show
+Review
+Format
+AI Assistant
+View
+Help
+Document name
+Editing
+Paste
+Clipboard
+New
+Slide Layout
+Character
+Paragraph
+Spacing & Color
+Illustrations
+Search
+Navigation
+Slides
+Outline
+1
+2
+3
+Click to add Notes
+Properties
+Slide
+Format:
+A6
+A5
+A4
+A3
+A2
+A1
+A0
+B6 (ISO)
+B5 (ISO)
+B4 (ISO)
+Letter
+Legal
+Long Bond
+Tabloid
+B6 (JIS)
+B5 (JIS)
+B4 (JIS)
+16 Kai
+32 Kai
+Big 32 Kai
+User
+DL Envelope
+C6 Envelope
+C6/5 Envelope
+C5 Envelope
+C4 Envelope
+Dia Slide
+Screen 4:3
+Screen 16:9
+Screen 16:10
+Widescreen
+On-screen Show (4:3)
+On-screen Show (16:9)
+On-screen Show (16:10)
+Japanese Postcard
+Orientation:
+Landscape
+Portrait
+Background:
+None
+Color
+Gradient
+Hatching
+Bitmap
+Pattern
+Use Slide Background
+Master Slide:
+Title Slide
+Title and Content
+Section Header
+Two Content
+Comparison
+Title Only
+Blank
+Content with Caption
+Picture with Caption
+Title and Vertical Text
+Vertical Title and Text
+Master Background
+Master Objects
+Master View
+Layouts
+Blank Slide
+Title and Subtitle
+One Box
+Two Boxes
+Title Only
+Centered Text
+Three Boxes (2 Left, 1 Right)
+Three Boxes (1 Left, 2 Right)
+Three Boxes (2 on Top over 1)
+Two Boxes (1 over 1)
+Four Boxes
+Six Boxes
+Vertical Title, Text, Chart
+Vertical Title, Vertical Text
+Title, Vertical Text
+Title, Two Vertical Boxes
+30
+Saved
