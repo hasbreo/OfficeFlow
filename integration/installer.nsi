@@ -57,11 +57,11 @@ Section "OfficeFlow apps and shared components (required)" Core
     ${EndIf}
   ${EndIf}
   SetOutPath "$INSTDIR"
-  File /r /x WordFlow.exe /x CellFlow.exe /x SlideFlow.exe /x MailFlow.exe /x PDFFlow.exe /x OfficeFlowUpdater.exe "${PAYLOAD}/*"
+  File /r /x WordFlow.exe /x CellFlow.exe /x SlideFlow.exe /x MailFlow.exe /x PDFFlow.exe /x OfficeFlowUpdater.exe "${PAYLOAD}\*"
   SetOutPath "$INSTDIR\collabora\program"
-  File "${PAYLOAD}/collabora/program/WordFlow.exe"
-  File "${PAYLOAD}/collabora/program/CellFlow.exe"
-  File "${PAYLOAD}/collabora/program/SlideFlow.exe"
+  File "${PAYLOAD}\collabora\program\WordFlow.exe"
+  File "${PAYLOAD}\collabora\program\CellFlow.exe"
+  File "${PAYLOAD}\collabora\program\SlideFlow.exe"
   SetOutPath "$INSTDIR"
   !insertmacro InstallWordFlow
   !insertmacro InstallCellFlow

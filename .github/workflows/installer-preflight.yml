@@ -53,3 +53,4 @@ jobs:
 
 # Assembly check includes native executables without pre-existing version resources.
 # Uses the runner PowerShell edition for Authenticode verification.
+# Verify Windows-native NSIS payload path separators.
