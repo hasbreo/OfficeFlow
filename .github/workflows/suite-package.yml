@@ -50,6 +50,9 @@ jobs:
       - name: Test install over existing OfficeFlow
         shell: pwsh
         run: ./ci/verify-installer.ps1 -Installer "$env:OFFICEFLOW_SHARED/release-0.5/OfficeFlow-Setup-0.5.0.exe"
+      - name: Test app-specific start pages and new blank documents
+        shell: pwsh
+        run: node ci/verify-start-pages.cjs "$env:OFFICEFLOW_INSTALLED/collabora"
       - name: Test the installed native editors
         shell: pwsh
         run: node ci/verify-native.cjs "$env:OFFICEFLOW_INSTALLED/collabora" --expect-editable
