@@ -18,7 +18,7 @@ permissions:
 jobs:
   package:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 90
     env:
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
