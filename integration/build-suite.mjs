@@ -13,7 +13,7 @@ for(const name of ['package.json','package-lock.json']){
  const p=path.join(source,name),j=JSON.parse(await fs.readFile(p,'utf8'));j.version=version;if(j.packages?.[''])j.packages[''].version=version;await fs.writeFile(p,JSON.stringify(j,null,2)+'\n');
 }
 run('npm',['run','build']);
-run('npx',['electron-builder','--win','dir','--x64','--config.directories.output=release-0.5']);
+run('npx',['electron-builder','--win','dir','--x64','--config.directories.output=release-0.5','--publish','never']);
 const payload=path.join(source,'release-0.5/win-unpacked');
 const PE=require('pe-library'),RE=require('resedit');
 async function identity(input,output,name,iconName){
@@ -46,7 +46,7 @@ html=html.replace(/<head(?:\s[^>]*)?>/i,head=>head+'\n<script src="officeflow-st
 await fs.writeFile(coolHtml,html);
 await fs.copyFile(path.join(integration,'native/officeflow-startup.js'),path.join(payload,'collabora/cool/officeflow-startup.js'));
 
-run('powershell.exe',['-NoProfile','-NonInteractive','-File',path.join(integration,'build-print-helper.ps1'),'-Destination',path.join(payload,'collabora')]);
+run('pwsh.exe',['-NoProfile','-NonInteractive','-File',path.join(integration,'build-print-helper.ps1'),'-Destination',path.join(payload,'collabora')]);
 await fs.writeFile(path.join(payload,'collabora/OFFICEFLOW-SOURCE.txt'),'OfficeFlow document editors use Collabora Online / LibreOffice technology.\nCorresponding pinned source and modifications: https://github.com/hasbreo/OfficeFlow\nComponent licences and attribution are retained in this directory.\n');
 // Store Electron once in NSIS and reconstruct its six process identities.
 const patches=path.join(source,'scripts/make-installer-patches.mjs');let text=await fs.readFile(patches,'utf8');
@@ -58,7 +58,7 @@ let cleanup='';for(const [name,ext] of [['WordFlow','docx'],['CellFlow','xlsx'],
 }
 await fs.writeFile('scripts/uninstall-shortcuts.nsh',cleanup);
 const webview=path.join(source,'build-deps/MicrosoftEdgeWebview2Setup.exe');
-run('powershell.exe',['-NoProfile','-NonInteractive','-File',path.join(integration,'fetch-webview-runtime.ps1'),'-Destination',webview]);
+run('pwsh.exe',['-NoProfile','-NonInteractive','-File',path.join(integration,'fetch-webview-runtime.ps1'),'-Destination',webview]);
 const installerScript=path.join(source,'scripts/native-installer.mjs');
 let installerCode=await fs.readFile(installerScript,'utf8');
 installerCode=installerCode.replace("'scripts/installer.nsi'","'-DWEBVIEW_SETUP='+process.env.OFFICEFLOW_WEBVIEW_SETUP,'scripts/installer.nsi'");

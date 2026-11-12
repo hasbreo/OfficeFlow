@@ -52,3 +52,4 @@ jobs:
       # The official fixture and this test installer are never uploaded or released.
 
 # Assembly check includes native executables without pre-existing version resources.
+# Uses the runner PowerShell edition for Authenticode verification.
