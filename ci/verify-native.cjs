@@ -26,7 +26,7 @@ async function close(child){
 (async()=>{
  await fs.mkdir(out,{recursive:true});
  for(let i=0;i<fixtures.length;i++){
-  const[name,template,type,part]=fixtures[i],exe=path.join(root,'program',upstream?'Collabora Office Preview.exe':name+'.exe'),doc=path.join(out,template),profile=path.join(out,name+'-profile'),port=9240+i;
+  const[name,template,type,part]=fixtures[i],exe=path.join(root,'program',upstream?'Collabora Office Preview.exe':name+'.exe'),doc=path.join(out,template),profile=path.join(out,(process.argv.includes('--expect-editable')?'installed-':'source-')+name+'-profile'),port=9240+i;
   const richName=['RichDocument.docx','RichWorkbook.xlsx','RichPresentation.pptx'][i];
   const source=rich?path.join(__dirname,'fixtures',richName):upstream?path.join(__dirname,'../collabora/templates',template):path.join(root,'templates',template);
   await fs.copyFile(source,doc);await fs.mkdir(profile,{recursive:true});
@@ -37,7 +37,7 @@ async function close(child){
    if(!upstream)assert.equal(new URL(page.url()).searchParams.get('officeflowApp'),name);
    await page.waitForFunction(()=>globalThis.app?.map?._docLayer?._docType,null,{timeout:90000});
    assert.equal(await page.evaluate(()=>app.map._docLayer._docType),type);
-   if(process.argv.includes('--expect-editable'))assert.equal(await page.evaluate(()=>globalThis.brandProductName),name,'Installed UI product identity differs');
+   if(process.argv.includes('--expect-editable'))await page.waitForFunction(name=>globalThis.brandProductName===name,name,{timeout:10000});
    if(!process.argv.includes('--expect-editable')&&await page.getByText('Viewing',{exact:true}).isVisible()){
     await page.getByText('Viewing',{exact:true}).click();await page.getByText('Editing Mode',{exact:true}).click();
    }

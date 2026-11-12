@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: MPL-2.0
 /* OfficeFlow product identity. Component attribution remains in LICENSE.html. */
-var brandProductName = (function () {
+function officeFlowProductName() {
   var name = new URLSearchParams(window.location.search).get('officeflowApp');
   return ['WordFlow', 'CellFlow', 'SlideFlow'].indexOf(name) >= 0 ? name : 'OfficeFlow';
-})();
+}
+var brandProductName = officeFlowProductName();
+window.brandProductName = brandProductName;
 var brandProductURL = 'https://hasbreo.com/officeflow/';
 window.addEventListener('load', function () {
+  brandProductName = officeFlowProductName();
+  window.brandProductName = brandProductName;
   // OfficeFlow supplies its own release/update experience. Do not open the
   // vendor's presentation window automatically when a document app starts.
   var welcome = window.L && window.L.Map && window.L.Map.Welcome;

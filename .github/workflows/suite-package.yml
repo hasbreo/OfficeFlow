@@ -22,6 +22,7 @@ jobs:
     timeout-minutes: 90
     env:
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+      OFFICEFLOW_CANDIDATE: ${{ runner.temp }}/officeflow-candidate
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,7 +46,14 @@ jobs:
             if($LASTEXITCODE -ne 0 -or $built -ne $current){throw "Native payload predates the current build recipe: $file"}
           }
           "id=$id" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Restore the matching built installer and source
+        id: bundle
+        uses: actions/cache/restore@v4
+        with:
+          key: officeflow-suite-v2-${{ steps.native.outputs.id }}-${{ hashFiles('integration/**', 'collabora/branding/**') }}
+          path: ${{ env.OFFICEFLOW_CANDIDATE }}
       - uses: actions/download-artifact@v4
+        if: steps.bundle.outputs.cache-hit != 'true'
         with:
           name: officeflow-native-development
           path: native-payload
@@ -54,11 +62,14 @@ jobs:
       - name: Install test client
         run: npm install --no-save --package-lock=false playwright@1.65.0 fflate@0.8.3
       - name: Verify source-built native editors
+        if: steps.bundle.outputs.cache-hit != 'true'
         run: node ci/verify-native.cjs native-payload --rich
       - name: Obtain checksum-pinned shared source
+        if: steps.bundle.outputs.cache-hit != 'true'
         shell: pwsh
         run: ./integration/fetch-shared.ps1
       - name: Prepare and build shared installer
+        if: steps.bundle.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           python integration/prepare-shared.py "$env:OFFICEFLOW_SHARED"
@@ -68,9 +79,33 @@ jobs:
           Set-Location $env:GITHUB_WORKSPACE
           node integration/build-suite.mjs "$env:OFFICEFLOW_SHARED" "$env:GITHUB_WORKSPACE/native-payload"
           if($LASTEXITCODE -ne 0){throw 'Installer build failed'}
+      - name: Retain the exact installer and corresponding source for validation retries
+        if: steps.bundle.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          python integration/package-source.py "$env:OFFICEFLOW_SHARED"
+          if($LASTEXITCODE -ne 0){throw 'Source packaging failed'}
+          New-Item -ItemType Directory -Force $env:OFFICEFLOW_CANDIDATE | Out-Null
+          Copy-Item "$env:OFFICEFLOW_SHARED/release-0.5/OfficeFlow-Setup-0.5.0.exe" $env:OFFICEFLOW_CANDIDATE
+          Copy-Item "$env:RUNNER_TEMP/officeflow-shared/OfficeFlow-0.5.0-source.zip" $env:OFFICEFLOW_CANDIDATE
+          $files=@('OfficeFlow-Setup-0.5.0.exe','OfficeFlow-0.5.0-source.zip') | ForEach-Object { @{name=$_;sha256=(Get-FileHash (Join-Path $env:OFFICEFLOW_CANDIDATE $_) -Algorithm SHA256).Hash.ToLowerInvariant()} }
+          @{commit=(git rev-parse HEAD);nativeRun='${{ steps.native.outputs.id }}';files=@($files)} | ConvertTo-Json -Depth 5 | Set-Content "$env:OFFICEFLOW_CANDIDATE/build.json" -Encoding utf8NoBOM
+      - name: Cache the built candidate before installation checks
+        if: steps.bundle.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          key: officeflow-suite-v2-${{ steps.native.outputs.id }}-${{ hashFiles('integration/**', 'collabora/branding/**') }}
+          path: ${{ env.OFFICEFLOW_CANDIDATE }}
+      - name: Verify exact candidate bytes
+        shell: pwsh
+        run: |
+          $build=Get-Content "$env:OFFICEFLOW_CANDIDATE/build.json" -Raw | ConvertFrom-Json
+          if($build.nativeRun -ne '${{ steps.native.outputs.id }}'){throw 'Cached candidate uses another native source build'}
+          foreach($file in $build.files){if((Get-FileHash (Join-Path $env:OFFICEFLOW_CANDIDATE $file.name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $file.sha256){throw 'Candidate checksum mismatch'}}
       - name: Test install over existing OfficeFlow
         shell: pwsh
-        run: ./ci/verify-installer.ps1 -Installer "$env:OFFICEFLOW_SHARED/release-0.5/OfficeFlow-Setup-0.5.0.exe"
+        run: ./ci/verify-installer.ps1 -Installer "$env:OFFICEFLOW_CANDIDATE/OfficeFlow-Setup-0.5.0.exe"
       - name: Test app-specific start pages and new blank documents
         shell: pwsh
         run: node ci/verify-start-pages.cjs "$env:OFFICEFLOW_INSTALLED/collabora"
@@ -83,9 +118,6 @@ jobs:
       - name: Test uninstall and rollback retention
         shell: pwsh
         run: ./ci/verify-uninstall.ps1
-      - name: Package corresponding source
-        shell: pwsh
-        run: python integration/package-source.py "$env:OFFICEFLOW_SHARED"
       - name: Retain test evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -103,11 +135,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $setup=Join-Path $env:OFFICEFLOW_SHARED 'release-0.5/OfficeFlow-Setup-0.5.0.exe'
-          $source=Join-Path $env:RUNNER_TEMP 'officeflow-shared/OfficeFlow-0.5.0-source.zip'
+          $setup=Join-Path $env:OFFICEFLOW_CANDIDATE 'OfficeFlow-Setup-0.5.0.exe'
+          $source=Join-Path $env:OFFICEFLOW_CANDIDATE 'OfficeFlow-0.5.0-source.zip'
           $sum=Join-Path $env:RUNNER_TEMP 'SHA256SUMS.txt'
           @($setup,$source) | ForEach-Object { (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant()+'  '+(Split-Path $_ -Leaf) } | Set-Content $sum -Encoding utf8NoBOM
-          $commit=git rev-parse HEAD
+          $commit=(Get-Content "$env:OFFICEFLOW_CANDIDATE/build.json" -Raw | ConvertFrom-Json).commit
           $tag="candidate-0.5.0-$env:GITHUB_RUN_ID"
           gh release create $tag $setup $source $sum --repo hasbreo/OfficeFlow --target $commit --title 'OfficeFlow 0.5.0 — verified Windows candidate' --prerelease --latest=false --notes 'Source-built Collabora document apps with the shared MailFlow/PDFFlow installer. Native edit/save/reopen, PDF export, independent shortcuts, Windows identities, upgrade and mail retention checks passed. Candidate assets are available here before promotion to the signed Hasbreo.com updater feed.'
           if($LASTEXITCODE -ne 0){throw 'Verified candidate asset publication failed'}

@@ -1,6 +1,29 @@
 param([Parameter(Mandatory=$true)][int]$EditorProcessId)
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
+Add-Type @'
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class OfficeFlowPrintTestWindow {
+ public delegate bool EnumProc(IntPtr window,IntPtr data);
+ [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc callback,IntPtr data);
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr window,StringBuilder value,int capacity);
+ [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window,out uint process);
+ [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+ public static IntPtr[] Dialogs(int process) {
+  var result=new List<IntPtr>();
+  EnumWindows((window,data)=>{
+   uint owner;GetWindowThreadProcessId(window,out owner);
+   var name=new StringBuilder(256);GetClassName(window,name,name.Capacity);
+   if(owner==process && name.ToString()=="#32770" && IsWindowVisible(window))result.Add(window);
+   return true;
+  },IntPtr.Zero);
+  return result.ToArray();
+ }
+}
+'@
 $deadline=(Get-Date).AddSeconds(60)
 $helper=$null
 while((Get-Date) -lt $deadline){
@@ -9,10 +32,9 @@ while((Get-Date) -lt $deadline){
  Start-Sleep -Milliseconds 200
 }
 if(-not $helper){throw 'The native editor did not launch its installed printing helper'}
-$condition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$helper.Id)
 while((Get-Date) -lt $deadline){
- $windows=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,$condition)
- foreach($window in $windows){
+ foreach($handle in [OfficeFlowPrintTestWindow]::Dialogs($helper.Id)){
+  $window=[System.Windows.Automation.AutomationElement]::FromHandle($handle)
   if($window.Current.Name -ne 'Print'){continue}
   $cancelCondition=New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Cancel')
   $cancel=$window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$cancelCondition)
