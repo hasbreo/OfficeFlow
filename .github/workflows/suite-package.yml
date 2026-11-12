@@ -1,0 +1,82 @@
+name: Package and verify OfficeFlow suite
+on:
+  workflow_run:
+    workflows: ['Build Collabora native editors']
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      native_run_id:
+        description: Successful native source-build run ID
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  package:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 90
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: officeflow-native-development
+          path: native-payload
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id || inputs.native_run_id }}
+      - name: Install test client
+        run: npm install --no-save --package-lock=false playwright@1.65.0 fflate@0.8.3
+      - name: Verify source-built native editors
+        run: node ci/verify-native.cjs native-payload
+      - name: Obtain checksum-pinned shared source
+        shell: pwsh
+        run: ./integration/fetch-shared.ps1
+      - name: Prepare and build shared installer
+        shell: pwsh
+        run: |
+          python integration/prepare-shared.py "$env:OFFICEFLOW_SHARED"
+          Set-Location $env:OFFICEFLOW_SHARED
+          npm ci --no-audit --no-fund
+          if($LASTEXITCODE -ne 0){throw 'Dependency installation failed'}
+          Set-Location $env:GITHUB_WORKSPACE
+          node integration/build-suite.mjs "$env:OFFICEFLOW_SHARED" "$env:GITHUB_WORKSPACE/native-payload"
+          if($LASTEXITCODE -ne 0){throw 'Installer build failed'}
+      - name: Test install over existing OfficeFlow
+        shell: pwsh
+        run: ./ci/verify-installer.ps1 -Installer "$env:OFFICEFLOW_SHARED/release-0.5/OfficeFlow-Setup-0.5.0.exe"
+      - name: Test the installed native editors
+        shell: pwsh
+        run: node ci/verify-native.cjs "$env:OFFICEFLOW_INSTALLED/collabora"
+      - name: Test installed MailFlow and PDFFlow
+        shell: pwsh
+        run: node ci/verify-shared.cjs "$env:OFFICEFLOW_INSTALLED"
+      - name: Test uninstall and rollback retention
+        shell: pwsh
+        run: ./ci/verify-uninstall.ps1
+      - name: Package corresponding source
+        shell: pwsh
+        run: python integration/package-source.py "$env:OFFICEFLOW_SHARED"
+      - name: Retain test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: officeflow-suite-test-evidence
+          path: probe-results/
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Retain verified candidate installer and source
+        uses: actions/upload-artifact@v4
+        with:
+          name: officeflow-0.5.0-verified-candidate
+          path: |
+            ${{ env.OFFICEFLOW_SHARED }}/release-0.5/OfficeFlow-Setup-0.5.0.exe
+            ${{ runner.temp }}/officeflow-shared/OfficeFlow-0.5.0-source.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
