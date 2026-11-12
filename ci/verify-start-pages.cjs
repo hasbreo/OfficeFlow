@@ -30,7 +30,8 @@ const apps=[['WordFlow','Blank Document','text','.docx'],['CellFlow','Blank Spre
    }
    assert(page,name+' blank document did not open');
    assert.equal(new URL(page.url()).searchParams.get('officeflowApp'),name);
-   await page.waitForFunction(()=>app.map.isEditMode(),null,{timeout:30000});
+   await page.waitForFunction(()=>app.map.isEditMode()&&app.map._docLoaded,null,{timeout:30000});
+   await page.evaluate(()=>{app.map.uiManager.setDocTypePref('onboardingTourSeen',true);app.onboardingTour?.end();});
    assert((await fs.readdir(docs)).some(file=>file.endsWith(extension)),name+' created the wrong blank file format');
    await page.screenshot({path:path.join(out,name+'-new.png')});
    // An untouched new document must close through the normal window action.

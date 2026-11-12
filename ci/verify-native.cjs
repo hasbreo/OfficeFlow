@@ -41,9 +41,9 @@ async function close(child){
    if(!process.argv.includes('--expect-editable')&&await page.getByText('Viewing',{exact:true}).isVisible()){
     await page.getByText('Viewing',{exact:true}).click();await page.getByText('Editing Mode',{exact:true}).click();
    }
-   await page.waitForFunction(()=>app.map.isEditMode()&&app.map._docLoaded&&app.onboardingTour,null,{timeout:45000});
+   await page.waitForFunction(()=>app.map.isEditMode()&&app.map._docLoaded&&app.map.uiManager,null,{timeout:45000});
    // Complete the first-run tour in this isolated test profile before editing.
-   await page.evaluate(()=>{app.map.uiManager.setDocTypePref('onboardingTourSeen',true);app.onboardingTour.end();});
+   await page.evaluate(()=>{app.map.uiManager.setDocTypePref('onboardingTourSeen',true);app.onboardingTour?.end();});
    console.log(name+' core readiness',await page.evaluate(()=>({editDoc:app.map.stateChangeHandler.getItemValue('EditDoc'),save:app.map.stateChangeHandler.getItemValue('Save'),modified:app.file.modified})));
    const before=await readPart(doc,part);
    if(name==='WordFlow'){await page.evaluate(()=>app.map.focus());await page.keyboard.type('OfficeFlow saved document test');}

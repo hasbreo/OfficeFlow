@@ -36,7 +36,16 @@ jobs:
         run: |
           $id=$env:NATIVE_RUN_ID
           if(-not $id){$id=gh api 'repos/hasbreo/OfficeFlow/actions/workflows/collabora-build.yml/runs?status=success&per_page=1' --jq '.workflow_runs[0].id'}
-          if($id -notmatch '^\d+
+          if($id -notmatch '^\d+$'){throw 'No successful native source build was found'}
+          $native=gh api "repos/hasbreo/OfficeFlow/actions/runs/$id" | ConvertFrom-Json
+          if($LASTEXITCODE -ne 0 -or $native.conclusion -ne 'success'){throw 'Native source build did not pass'}
+          foreach($file in @('collabora/prepare.py','collabora/ci-build.sh')){
+            $built=gh api "repos/hasbreo/OfficeFlow/contents/$($file)?ref=$($native.head_sha)" --jq '.sha'
+            $current=git rev-parse "HEAD:$file"
+            if($LASTEXITCODE -ne 0 -or $built -ne $current){throw "Native payload predates the current build recipe: $file"}
+          }
+          "id=$id" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - uses: actions/download-artifact@v4
         with:
           name: officeflow-native-development
           path: native-payload
@@ -83,80 +92,6 @@ jobs:
         with:
           name: officeflow-suite-test-evidence
           overwrite: true
-          path: |
-            probe-results/*.png
-            probe-results/*.txt
-            probe-results/*.pdf
-          if-no-files-found: ignore
-          retention-days: 7
-      - name: Publish the verified candidate assets
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $setup=Join-Path $env:OFFICEFLOW_SHARED 'release-0.5/OfficeFlow-Setup-0.5.0.exe'
-          $source=Join-Path $env:RUNNER_TEMP 'officeflow-shared/OfficeFlow-0.5.0-source.zip'
-          $sum=Join-Path $env:RUNNER_TEMP 'SHA256SUMS.txt'
-          @($setup,$source) | ForEach-Object { (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant()+'  '+(Split-Path $_ -Leaf) } | Set-Content $sum -Encoding utf8NoBOM
-          $commit=git rev-parse HEAD
-          $tag="candidate-0.5.0-$env:GITHUB_RUN_ID"
-          gh release create $tag $setup $source $sum --repo hasbreo/OfficeFlow --target $commit --title 'OfficeFlow 0.5.0 — verified Windows candidate' --prerelease --latest=false --notes 'Source-built Collabora document apps with the shared MailFlow/PDFFlow installer. Native edit/save/reopen, PDF export, independent shortcuts, Windows identities, upgrade and mail retention checks passed. Candidate assets are available here before promotion to the signed Hasbreo.com updater feed.'
-          if($LASTEXITCODE -ne 0){throw 'Verified candidate asset publication failed'}
-){throw 'No successful native source build was found'}
-          $native=gh api "repos/hasbreo/OfficeFlow/actions/runs/$id" | ConvertFrom-Json
-          if($LASTEXITCODE -ne 0 -or $native.conclusion -ne 'success'){throw 'Native source build did not pass'}
-          foreach($file in @('collabora/prepare.py','collabora/ci-build.sh')){
-            $built=gh api "repos/hasbreo/OfficeFlow/contents/$($file)?ref=$($native.head_sha)" --jq '.sha'
-            $current=git rev-parse "HEAD:$file"
-            if($LASTEXITCODE -ne 0 -or $built -ne $current){throw "Native payload predates the current build recipe: $file"}
-          }
-          "id=$id" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-      - uses: actions/download-artifact@v4
-        with:
-          name: officeflow-native-development
-          path: native-payload
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ github.event.workflow_run.id || inputs.native_run_id }}
-      - name: Install test client
-        run: npm install --no-save --package-lock=false playwright@1.65.0 fflate@0.8.3
-      - name: Verify source-built native editors
-        run: node ci/verify-native.cjs native-payload --rich
-      - name: Obtain checksum-pinned shared source
-        shell: pwsh
-        run: ./integration/fetch-shared.ps1
-      - name: Prepare and build shared installer
-        shell: pwsh
-        run: |
-          python integration/prepare-shared.py "$env:OFFICEFLOW_SHARED"
-          Set-Location $env:OFFICEFLOW_SHARED
-          npm ci --no-audit --no-fund
-          if($LASTEXITCODE -ne 0){throw 'Dependency installation failed'}
-          Set-Location $env:GITHUB_WORKSPACE
-          node integration/build-suite.mjs "$env:OFFICEFLOW_SHARED" "$env:GITHUB_WORKSPACE/native-payload"
-          if($LASTEXITCODE -ne 0){throw 'Installer build failed'}
-      - name: Test install over existing OfficeFlow
-        shell: pwsh
-        run: ./ci/verify-installer.ps1 -Installer "$env:OFFICEFLOW_SHARED/release-0.5/OfficeFlow-Setup-0.5.0.exe"
-      - name: Test app-specific start pages and new blank documents
-        shell: pwsh
-        run: node ci/verify-start-pages.cjs "$env:OFFICEFLOW_INSTALLED/collabora"
-      - name: Test the installed native editors
-        shell: pwsh
-        run: node ci/verify-native.cjs "$env:OFFICEFLOW_INSTALLED/collabora" --expect-editable
-      - name: Test installed MailFlow and PDFFlow
-        shell: pwsh
-        run: node ci/verify-shared.cjs "$env:OFFICEFLOW_INSTALLED"
-      - name: Test uninstall and rollback retention
-        shell: pwsh
-        run: ./ci/verify-uninstall.ps1
-      - name: Package corresponding source
-        shell: pwsh
-        run: python integration/package-source.py "$env:OFFICEFLOW_SHARED"
-      - name: Retain test evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: officeflow-suite-test-evidence
           path: |
             probe-results/*.png
             probe-results/*.txt
