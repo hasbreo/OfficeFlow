@@ -27,7 +27,7 @@ Function .onInit
   Pop $0
   Pop $1
   ${If} $0 != 0
-    MessageBox MB_OK|MB_ICONINFORMATION "Close all OfficeFlow programs, then run Setup again. Save your work before closing."
+    MessageBox MB_OK|MB_ICONINFORMATION "Close all OfficeFlow programs, then run Setup again. Save your work before closing." /SD IDOK
     Abort
   ${EndIf}
 FunctionEnd
@@ -52,7 +52,7 @@ Section "OfficeFlow apps and shared components (required)" Core
     Call WebViewPresent
     ${If} $0 == ""
     ${OrIf} $0 == "0.0.0.0"
-      MessageBox MB_OK|MB_ICONINFORMATION "OfficeFlow needs Microsoft WebView2. Connect to the internet, then run Setup again."
+      MessageBox MB_OK|MB_ICONINFORMATION "OfficeFlow needs Microsoft WebView2. Connect to the internet, then run Setup again." /SD IDOK
       Abort
     ${EndIf}
   ${EndIf}

@@ -11,7 +11,8 @@ $old=Join-Path $env:RUNNER_TEMP 'OfficeFlow-Setup-0.4.3.exe'
 Invoke-WebRequest 'https://hasbreo.com/downloads/officeflow/OfficeFlow-Setup-0.4.3.exe' -OutFile $old -UserAgent 'OfficeFlow-CI/0.5'
 if((Get-FileHash $old -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'a93b76d6d02ed8f3025071317905dd2cec73d2e40097259022fc130fc3f13f2a'){throw 'Prior installer checksum mismatch'}
 function Install($file){
- $p=Start-Process -FilePath $file -ArgumentList "/S /D=$root" -Wait -PassThru
+ $p=Start-Process -FilePath $file -ArgumentList "/S /D=$root" -PassThru
+ if(-not $p.WaitForExit(240000)){$p.Kill();throw 'Silent installer did not finish within four minutes'}
  if($p.ExitCode -ne 0){throw "Installer exit code $($p.ExitCode)"}
 }
 Install $old
