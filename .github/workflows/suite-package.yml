@@ -33,7 +33,7 @@ jobs:
       - name: Install test client
         run: npm install --no-save --package-lock=false playwright@1.65.0 fflate@0.8.3
       - name: Verify source-built native editors
-        run: node ci/verify-native.cjs native-payload
+        run: node ci/verify-native.cjs native-payload --rich
       - name: Obtain checksum-pinned shared source
         shell: pwsh
         run: ./integration/fetch-shared.ps1

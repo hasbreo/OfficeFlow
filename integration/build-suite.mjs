@@ -1,10 +1,10 @@
 // Assemble only a source-built native payload; the upstream preview is not used here.
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import {pathToFileURL} from 'node:url';
+import {pathToFileURL,fileURLToPath} from 'node:url';
 import {createRequire} from 'node:module';
 import {spawnSync} from 'node:child_process';
-const integration=path.dirname(new URL(import.meta.url).pathname).replace(/^\/([A-Za-z]:)/,'$1');
+const integration=path.dirname(fileURLToPath(import.meta.url));
 const source=path.resolve(process.argv[2]),native=path.resolve(process.argv[3]);
 process.chdir(source);
 const require=createRequire(path.join(source,'package.json')),version='0.5.0';
@@ -34,6 +34,7 @@ for(const name of ['WordFlow','CellFlow','SlideFlow']){
  const p=path.join(payload,'collabora/program',name+'.exe');await identity(p,p,name,name.toLowerCase());
 }
 await fs.rm(path.join(payload,'collabora/program/OfficeFlow.exe'),{force:true});
+run('powershell.exe',['-NoProfile','-NonInteractive','-File',path.join(integration,'build-print-helper.ps1'),'-Destination',path.join(payload,'collabora')]);
 await fs.writeFile(path.join(payload,'collabora/OFFICEFLOW-SOURCE.txt'),'OfficeFlow document editors use Collabora Online / LibreOffice technology.\nCorresponding pinned source and modifications: https://github.com/hasbreo/OfficeFlow\nComponent licences and attribution are retained in this directory.\n');
 // Store Electron once in NSIS and reconstruct its six process identities.
 const patches=path.join(source,'scripts/make-installer-patches.mjs');let text=await fs.readFile(patches,'utf8');

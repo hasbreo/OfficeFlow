@@ -1,7 +1,7 @@
 name: Probe official Collabora desktop runtime
 on:
   push:
-    paths: ['.github/workflows/native-probe.yml', 'ci/probe-native.cjs']
+    paths: ['.github/workflows/native-probe.yml', 'ci/probe-native.cjs', 'ci/verify-native.cjs', 'ci/save-native-pdf.ps1', 'ci/fixtures/**']
   workflow_dispatch:
 permissions:
   contents: read
@@ -27,6 +27,9 @@ jobs:
       - name: Open all three document types with the native engine
         shell: pwsh
         run: node ci/probe-native.cjs "$env:RUNNER_TEMP/collabora"
+      - name: Verify rich Office files and PDF exports in the upstream fixture
+        shell: pwsh
+        run: node ci/verify-native.cjs "$env:RUNNER_TEMP/collabora" --upstream-fixture --rich
       - name: Retain synthetic test evidence
         if: always()
         uses: actions/upload-artifact@v4

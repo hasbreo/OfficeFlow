@@ -3,6 +3,7 @@ const {chromium}=require('playwright'),{spawn,spawnSync}=require('node:child_pro
 const fs=require('node:fs/promises'),path=require('node:path'),assert=require('node:assert/strict');
 const {unzipSync,strFromU8}=require('fflate');
 const root=path.resolve(process.argv[2]),out=path.resolve('probe-results');
+const upstream=process.argv.includes('--upstream-fixture'),rich=process.argv.includes('--rich');
 const fixtures=[['WordFlow','TextDocument.docx','text','word/document.xml'],['CellFlow','Spreadsheet.xlsx','spreadsheet','xl/worksheets/sheet1.xml'],['SlideFlow','Presentation.pptx','presentation','ppt/presentation.xml']];
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function readPart(file,part){return strFromU8(unzipSync(await fs.readFile(file))[part]);}
@@ -25,13 +26,15 @@ async function close(child){
 (async()=>{
  await fs.mkdir(out,{recursive:true});
  for(let i=0;i<fixtures.length;i++){
-  const[name,template,type,part]=fixtures[i],exe=path.join(root,'program',name+'.exe'),doc=path.join(out,template),profile=path.join(out,name+'-profile'),port=9240+i;
-  await fs.copyFile(path.join(root,'templates',template),doc);await fs.mkdir(profile,{recursive:true});
+  const[name,template,type,part]=fixtures[i],exe=path.join(root,'program',upstream?'Collabora Office Preview.exe':name+'.exe'),doc=path.join(out,template),profile=path.join(out,name+'-profile'),port=9240+i;
+  const richName=['RichDocument.docx','RichWorkbook.xlsx','RichPresentation.pptx'][i];
+  const source=rich?path.join(__dirname,'fixtures',richName):upstream?path.join(__dirname,'../collabora/templates',template):path.join(root,'templates',template);
+  await fs.copyFile(source,doc);await fs.mkdir(profile,{recursive:true});
   const launch=()=>spawn(exe,[doc],{cwd:path.dirname(exe),env:{...process.env,CODA_TEST_DATA_DIR:profile,CODA_TEST_REMOTE_DEBUGGING_PORT:String(port),CODA_LOGLEVEL:'warning'},stdio:'ignore'});
   let child=launch(),browser,page;
   try{
    ({browser,page}=await connect(child,port));
-   assert.equal(new URL(page.url()).searchParams.get('officeflowApp'),name);
+   if(!upstream)assert.equal(new URL(page.url()).searchParams.get('officeflowApp'),name);
    await page.waitForFunction(()=>globalThis.app?.map?._docLayer?._docType,{timeout:90000});
    assert.equal(await page.evaluate(()=>app.map._docLayer._docType),type);
    if(await page.getByText('Viewing',{exact:true}).isVisible()){
@@ -54,13 +57,31 @@ async function close(child){
     }catch{}await pause(300);
    }
    assert(good,name+' content did not survive native OOXML save');
+   if(rich){
+    const archive=unzipSync(await fs.readFile(doc)),parts=Object.keys(archive),xml=await readPart(doc,part);
+    if(name==='WordFlow'){
+     assert(xml.includes('<w:tbl>'),'Document table was lost');assert(parts.some(p=>p.startsWith('word/media/')),'Document image was lost');
+     assert(parts.filter(p=>/^word\/header\d+\.xml$/.test(p)).some(p=>strFromU8(archive[p]).includes('OfficeFlow fixture header')),'Header was lost');
+    }else if(name==='CellFlow'){
+     assert(/<v>17<\/v>/.test(xml)&&/<v>24<\/v>/.test(xml),'Cross-sheet formulas did not calculate');
+     assert(parts.some(p=>/^xl\/charts\/chart\d+\.xml$/.test(p)),'Workbook chart was lost');
+    }else assert(parts.some(p=>p.startsWith('ppt/media/')),'Slide image was lost');
+   }
+   const pdf=path.join(out,name+'-export.pdf');await fs.rm(pdf,{force:true});
+   const picker=spawn('powershell.exe',['-NoProfile','-NonInteractive','-File',path.join(__dirname,'save-native-pdf.ps1'),'-ProcessId',String(child.pid),'-Destination',pdf],{stdio:'inherit'});
+   await page.evaluate(()=>window.postMobileMessage('downloadas name=OfficeFlow.pdf id=export format=pdf options='));
+   const pdfUntil=Date.now()+60000;let pdfBytes;
+   while(Date.now()<pdfUntil){try{pdfBytes=await fs.readFile(pdf);if(pdfBytes.length>1000&&pdfBytes.subarray(0,5).toString()==='%PDF-')break;}catch{}await pause(300);}
+   assert(pdfBytes&&pdfBytes.length>1000&&pdfBytes.subarray(0,5).toString()==='%PDF-',name+' native PDF export failed');
+   if(picker.exitCode===null)await new Promise(resolve=>picker.once('exit',resolve));
+   assert.equal(picker.exitCode,0,'Native PDF save dialog did not complete');
    await page.screenshot({path:path.join(out,name+'.png')});await fs.writeFile(path.join(out,name+'.txt'),await page.locator('body').innerText());
    await close(child);await browser.close();browser=null;
    // Reopen the bytes just written using the same real native application.
    child=launch();({browser,page}=await connect(child,port));
    await page.waitForFunction(()=>globalThis.app?.map?._docLayer?._docType,{timeout:90000});
    assert.equal(await page.evaluate(()=>app.map._docLayer._docType),type);await close(child);
-   console.log(name+' native edit, OOXML save, normal close and reopen PASS');
+   console.log(name+' native edit, OOXML save, PDF export, normal close and reopen PASS');
   }catch(error){
    if(page){await page.screenshot({path:path.join(out,name+'-failure.png')}).catch(()=>{});await fs.writeFile(path.join(out,name+'-failure.txt'),await page.locator('body').innerText()).catch(()=>{});}throw error;
   }finally{if(browser)await browser.close().catch(()=>{});if(child.exitCode===null)spawnSync('taskkill',['/PID',String(child.pid),'/T','/F'],{stdio:'ignore'});}
