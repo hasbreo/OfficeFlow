@@ -50,3 +50,5 @@ jobs:
         shell: pwsh
         run: ./ci/verify-uninstall.ps1
       # The official fixture and this test installer are never uploaded or released.
+
+# Assembly check includes native executables without pre-existing version resources.

@@ -19,7 +19,7 @@ const PE=require('pe-library'),RE=require('resedit');
 async function identity(input,output,name,iconName){
  const exe=PE.NtExecutable.from(await fs.readFile(input),{ignoreCert:true}),res=PE.NtExecutableResource.from(exe);
  const versions=RE.Resource.VersionInfo.fromEntries(res.entries);
- if(!versions.length)throw Error('Missing native version resource: '+input);
+ if(!versions.length)versions.push(RE.Resource.VersionInfo.createEmpty());
  for(const vi of versions){
   vi.setFileVersion(0,5,0,0,1033);vi.setProductVersion(0,5,0,0,1033);
   vi.setStringValues({lang:1033,codepage:1200},{FileDescription:name,ProductName:name,InternalName:name,OriginalFilename:path.basename(output),CompanyName:'Hasbreo'});vi.outputToResourceEntries(res.entries);
@@ -38,6 +38,14 @@ for(const name of ['WordFlow','CellFlow','SlideFlow']){
  const p=path.join(payload,'collabora/program',name+'.exe');await identity(p,p,name,name.toLowerCase());
 }
 await fs.rm(path.join(payload,'collabora/program/OfficeFlow.exe'),{force:true});
+// Load the native startup preference before Collabora reads its URL settings.
+const coolHtml=path.join(payload,'collabora/cool/cool.html');
+let html=await fs.readFile(coolHtml,'utf8');
+if((html.match(/<head(?:\s[^>]*)?>/gi)||[]).length!==1)throw Error('Native editor HTML structure changed');
+html=html.replace(/<head(?:\s[^>]*)?>/i,head=>head+'\n<script src="officeflow-startup.js"></script>');
+await fs.writeFile(coolHtml,html);
+await fs.copyFile(path.join(integration,'native/officeflow-startup.js'),path.join(payload,'collabora/cool/officeflow-startup.js'));
+
 run('powershell.exe',['-NoProfile','-NonInteractive','-File',path.join(integration,'build-print-helper.ps1'),'-Destination',path.join(payload,'collabora')]);
 await fs.writeFile(path.join(payload,'collabora/OFFICEFLOW-SOURCE.txt'),'OfficeFlow document editors use Collabora Online / LibreOffice technology.\nCorresponding pinned source and modifications: https://github.com/hasbreo/OfficeFlow\nComponent licences and attribution are retained in this directory.\n');
 // Store Electron once in NSIS and reconstruct its six process identities.
