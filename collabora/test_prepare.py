@@ -25,6 +25,7 @@ class NativeIdentityPatch(unittest.TestCase):
         patched = module.patch_native_ui(original)
         self.assertEqual(patched, module.patch_native_ui(patched))
         self.assertIn('&officeflowApp=', patched)
+        self.assertIn('data->mode == DocumentMode::WELCOME ? "&startreadonly=true"', patched)
         for ext in ['docx', 'xlsx', 'pptx']:
             self.assertIn('templateExtension = L"' + ext + '";', patched)
 

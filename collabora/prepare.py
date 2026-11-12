@@ -77,6 +77,10 @@ def patch_native_ui(text):
         if native.count(needle) != 1:
             raise ValueError('Upstream document URL changed')
         native = native.replace(needle, '                        coolURL += "&officeflowApp=" + officeFlowAppName;\n' + needle)
+    # Local documents already have edit permission; only the welcome deck starts in Viewing mode.
+    native = native.replace(
+        'data->mode != DocumentMode::NEW ? "&startreadonly=true"',
+        'data->mode == DocumentMode::WELCOME ? "&startreadonly=true"')
     for old, new in [('odt', 'docx'), ('ods', 'xlsx'), ('odp', 'pptx')]:
         needle = 'templateExtension = L"' + old + '";'
         replacement = 'templateExtension = L"' + new + '";'
