@@ -1,0 +1,51 @@
+File
+Home
+Insert
+Layout
+References
+Review
+Format
+Form
+AI Assistant
+View
+Help
+Document name
+Editing
+Paste
+Clipboard
+Font
+Paragraph
+Styles
+Insert
+Search
+OfficeFlow saved document test
+Properties
+Style
+Paragraph Style
+Character
+Font Name
+Font Size
+Paragraph
+Spacing:
+Above:
+Below:
+Line Spacing:
+Indent:
+Before:
+After:
+First:
+Page 1 of 2
+37 words, 225 characters
+English (USA)
+60
+Welcome to Collabora Online
+This short tour points out the parts of the screen you will use most.
+Step 1 of 6
+Skip
+Back
+Next
+Cannot Save Document
+"TextDocument.docx" could not be written. The file may be read-only or in use by another program. You can save your changes to a different file.
+Show technical details
+Cancel
+Save As
