@@ -8,10 +8,15 @@ $deadline=(Get-Date).AddSeconds(45)
 while((Get-Date) -lt $deadline){
  $windows=[System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,$condition)
  foreach($window in $windows){
-  $edit=$window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$nameCondition)
-  if($null -eq $edit){continue}
-  $pattern=$edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-  $pattern.SetValue($Destination)
+  $edits=$window.FindAll([System.Windows.Automation.TreeScope]::Descendants,$nameCondition)
+  $written=$false
+  foreach($edit in $edits){
+   $pattern=$null
+   if($edit.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern,[ref]$pattern) -and -not $pattern.Current.IsReadOnly){
+    $pattern.SetValue($Destination);$written=$true;break
+   }
+  }
+  if(-not $written){continue}
   $save=$window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$saveCondition)
   if($null -eq $save){continue}
   $save.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
