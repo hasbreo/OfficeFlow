@@ -50,7 +50,9 @@ jobs:
         id: bundle
         uses: actions/cache/restore@v4
         with:
-          key: officeflow-suite-v2-${{ steps.native.outputs.id }}-${{ hashFiles('integration/**', 'collabora/branding/**') }}
+          key: officeflow-suite-v2-${{ steps.native.outputs.id }}-${{ hashFiles('integration/**', 'collabora/branding/**', '!integration/**/__pycache__/**') }}
+          # Exact 0.5.1 candidate, built before the cache-key normalization.
+          restore-keys: officeflow-suite-v2-43141296679-3beb5b93cb8ac3c4af5c71717aa8b3be5fb137a9f6e596869cf88a1d99bb6ec8
           path: ${{ env.OFFICEFLOW_CANDIDATE }}
       - uses: actions/download-artifact@v4
         if: steps.bundle.outputs.cache-hit != 'true'
@@ -97,7 +99,7 @@ jobs:
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          key: officeflow-suite-v2-${{ steps.native.outputs.id }}-${{ hashFiles('integration/**', 'collabora/branding/**') }}
+          key: ${{ steps.bundle.outputs.cache-primary-key }}
           path: ${{ env.OFFICEFLOW_CANDIDATE }}
       - name: Verify exact candidate bytes
         shell: pwsh
