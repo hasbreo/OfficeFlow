@@ -14,7 +14,7 @@ def prepare(installer,source,key,site,output):
     assert installer.name==f'OfficeFlow-Setup-{version}.exe' and source.name==f'OfficeFlow-{version}-source.zip'
     files={k:describe(p,k,version) for k,p in [('installer',installer),('source',source)]}
     assert 0<files['installer']['size']<=1024**3,'Installer exceeds the existing updater limit'
-    manifest={'version':version,'url':'https://hasbreo.com/downloads/officeflow/'+installer.name,'sha256':files['installer']['sha256'],'size':files['installer']['size'],'notes':'MailFlow can run quietly in the Windows system tray, downloading all connected accounts every five minutes. Click the tray icon or Start menu to reopen, right-click to quit, and optionally start quietly with Windows from Settings. Existing mail archives and the Collabora document apps are retained.'}
+    manifest={'version':version,'url':'https://hasbreo.com/downloads/officeflow/'+installer.name,'sha256':files['installer']['sha256'],'size':files['installer']['size'],'notes':'WordFlow, CellFlow and SlideFlow now use the full local Collabora desktop engine. Independent native apps, mint theme, Office file editing, PDF export, bundled printing runtime and shared signed updates. MailFlow and PDFFlow keep their existing data.'}
     private=load_pem_private_key(key.read_bytes(),password=None)
     assert isinstance(private,Ed25519PrivateKey)
     raw=json.dumps(manifest,separators=(',',':'),ensure_ascii=False).encode()
