@@ -28,7 +28,7 @@ const root=process.argv[2];
  }
  const quiet=await electron.launch({executablePath:path.join(root,'MailFlow.exe'),args:['--background'],env:{...process.env,OFFICEFLOW_DATA_DIR:path.join(process.env.APPDATA,'officeflow')}});
  try{
-  await quiet.evaluate(async({app})=>{await app.whenReady();});
+  await quiet.evaluate(async({app,ipcMain})=>{await app.whenReady();for(let i=0;i<100&&!ipcMain._invokeHandlers.has('mailIndex');i++)await new Promise(r=>setTimeout(r,100));if(!ipcMain._invokeHandlers.has('mailIndex'))throw Error('Mail startup did not finish');});
   assert.equal(await quiet.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().filter(w=>w.isVisible()).length),0);
   await quiet.evaluate(({app})=>app.emit('second-instance',{},[process.execPath]));
   const page=await quiet.firstWindow();await page.getByRole('button',{name:'New message',exact:true}).waitFor();
