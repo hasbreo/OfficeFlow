@@ -10,7 +10,7 @@ def describe(path,kind,version):
             size+=len(chunk);sha.update(chunk);parts.append({'size':len(chunk),'sha256':hashlib.sha256(chunk).hexdigest()})
     return {'filename':path.name,'size':size,'sha256':sha.hexdigest(),'type':'application/zip' if kind=='source' else 'application/vnd.microsoft.portable-executable','parts':parts}
 def prepare(installer,source,key,site,output):
-    version='0.5.0'
+    version='0.5.1'
     assert installer.name==f'OfficeFlow-Setup-{version}.exe' and source.name==f'OfficeFlow-{version}-source.zip'
     files={k:describe(p,k,version) for k,p in [('installer',installer),('source',source)]}
     assert 0<files['installer']['size']<=1024**3,'Installer exceeds the existing updater limit'

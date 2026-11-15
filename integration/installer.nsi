@@ -94,6 +94,7 @@ SectionEnd
 !insertmacro Shortcut "MailFlow" "mail" "MailFlow.exe" ""
 !insertmacro Shortcut "PDFFlow" "pdf" "PDFFlow.exe" "pdf"
 Section "Uninstall"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "MailFlow"
   !include "uninstall-files.nsh"
   Delete "$INSTDIR\Uninstall OfficeFlow.exe"
   RMDir "$INSTDIR"

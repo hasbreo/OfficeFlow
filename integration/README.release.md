@@ -1,4 +1,4 @@
-# OfficeFlow 0.5.0
+# OfficeFlow 0.5.1
 
 Five independent Windows apps with one installer:
 
@@ -12,7 +12,7 @@ The three document apps now use the full local Collabora desktop engine and inte
 
 ## Install or update
 
-Close OfficeFlow programs and run `OfficeFlow-Setup-0.5.0.exe`. Install over the existing location to update. Each Start-menu shortcut opens its own app. Older pinned shortcuts are forwarded to the matching native editor.
+Close OfficeFlow programs and run `OfficeFlow-Setup-0.5.1.exe`. Install over the existing location to update. Each Start-menu shortcut opens its own app. Older pinned shortcuts are forwarded to the matching native editor.
 
 Windows 10/11, 64-bit. Setup installs Microsoft WebView2 if it is missing; that dependency installation needs internet access.
 
@@ -27,6 +27,8 @@ New documents use DOCX, XLSX and PPTX. The native document engine supports addit
 Keep original copies of important Microsoft Office files. OfficeFlow uses a different engine; fonts, macros, advanced features and exact layout can differ from Microsoft Office. This is not a promise of perfect formatting compatibility.
 
 ## Mail
+
+Closing MailFlow keeps it in the Windows system tray. It checks all connected accounts every five minutes and saves complete messages locally. Click its tray icon or Start-menu shortcut to reopen it; right-click the icon and choose Quit MailFlow to stop it. Settings includes an optional Start MailFlow quietly with Windows checkbox. The computer must be awake and online to download new mail.
 
 MailFlow continues to use the publisher's registered Google desktop client. Google's restricted-scope verification is separate from this engine migration. Offline archives and imported mail remain available independently of Google sign-in. Complete downloaded messages and attachments are retained locally; choose a separate backup location for additional protection.
 

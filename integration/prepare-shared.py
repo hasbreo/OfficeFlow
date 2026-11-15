@@ -29,5 +29,8 @@ def prepare(root):
         text=text[:a]+'''const target=path.join(this.app.getPath('temp'),`OfficeFlow-Setup-${m.version}.exe`);await require('./download-verified.cjs').downloadVerified(download,m,target);'''+text[b:]
         text=text.replace('AbortSignal.timeout(300000)','AbortSignal.timeout(1800000)');updates.write_text(text)
 
+    import importlib.util
+    spec=importlib.util.spec_from_file_location('mail_tray',here/'mail-tray.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);module.apply(root)
+
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('source',type=Path);a=p.parse_args();prepare(a.source.resolve())

@@ -7,7 +7,7 @@ import {spawnSync} from 'node:child_process';
 const integration=path.dirname(fileURLToPath(import.meta.url));
 const source=path.resolve(process.argv[2]),native=path.resolve(process.argv[3]);
 process.chdir(source);
-const require=createRequire(path.join(source,'package.json')),version='0.5.0';
+const require=createRequire(path.join(source,'package.json')),version='0.5.1';
 function run(command,args){const r=spawnSync(command,args,{stdio:'inherit',shell:process.platform==='win32'&&command!==process.execPath});if(r.status!==0)throw Error(command+' failed: '+r.status);}
 for(const name of ['package.json','package-lock.json']){
  const p=path.join(source,name),j=JSON.parse(await fs.readFile(p,'utf8'));j.version=version;if(j.packages?.[''])j.packages[''].version=version;await fs.writeFile(p,JSON.stringify(j,null,2)+'\n');
@@ -21,7 +21,7 @@ async function identity(input,output,name,iconName){
  const versions=RE.Resource.VersionInfo.fromEntries(res.entries);
  if(!versions.length)versions.push(RE.Resource.VersionInfo.createEmpty());
  for(const vi of versions){
-  vi.setFileVersion(0,5,0,0,1033);vi.setProductVersion(0,5,0,0,1033);
+  vi.setFileVersion(0,5,1,0,1033);vi.setProductVersion(0,5,1,0,1033);
   vi.setStringValues({lang:1033,codepage:1200},{FileDescription:name,ProductName:name,InternalName:name,OriginalFilename:path.basename(output),CompanyName:'Hasbreo'});vi.outputToResourceEntries(res.entries);
  }
  const icon=RE.Data.IconFile.from(await fs.readFile(path.join(source,'assets',iconName+'.ico')));

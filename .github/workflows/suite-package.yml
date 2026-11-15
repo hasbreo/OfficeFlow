@@ -59,6 +59,8 @@ jobs:
           path: native-payload
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ steps.native.outputs.id }}
+      - name: Test background sync scheduler
+        run: node --test integration/shared/mail-background.test.cjs
       - name: Install test client
         run: npm install --no-save --package-lock=false playwright@1.65.0 fflate@0.8.3
       - name: Verify source-built native editors
@@ -86,9 +88,9 @@ jobs:
           python integration/package-source.py "$env:OFFICEFLOW_SHARED"
           if($LASTEXITCODE -ne 0){throw 'Source packaging failed'}
           New-Item -ItemType Directory -Force $env:OFFICEFLOW_CANDIDATE | Out-Null
-          Copy-Item "$env:OFFICEFLOW_SHARED/release-0.5/OfficeFlow-Setup-0.5.0.exe" $env:OFFICEFLOW_CANDIDATE
-          Copy-Item "$env:RUNNER_TEMP/officeflow-shared/OfficeFlow-0.5.0-source.zip" $env:OFFICEFLOW_CANDIDATE
-          $files=@('OfficeFlow-Setup-0.5.0.exe','OfficeFlow-0.5.0-source.zip') | ForEach-Object { @{name=$_;sha256=(Get-FileHash (Join-Path $env:OFFICEFLOW_CANDIDATE $_) -Algorithm SHA256).Hash.ToLowerInvariant()} }
+          Copy-Item "$env:OFFICEFLOW_SHARED/release-0.5/OfficeFlow-Setup-0.5.1.exe" $env:OFFICEFLOW_CANDIDATE
+          Copy-Item "$env:RUNNER_TEMP/officeflow-shared/OfficeFlow-0.5.1-source.zip" $env:OFFICEFLOW_CANDIDATE
+          $files=@('OfficeFlow-Setup-0.5.1.exe','OfficeFlow-0.5.1-source.zip') | ForEach-Object { @{name=$_;sha256=(Get-FileHash (Join-Path $env:OFFICEFLOW_CANDIDATE $_) -Algorithm SHA256).Hash.ToLowerInvariant()} }
           @{commit=(git rev-parse HEAD);nativeRun='${{ steps.native.outputs.id }}';files=@($files)} | ConvertTo-Json -Depth 5 | Set-Content "$env:OFFICEFLOW_CANDIDATE/build.json" -Encoding utf8NoBOM
       - name: Cache the built candidate before installation checks
         if: steps.bundle.outputs.cache-hit != 'true'
@@ -105,7 +107,7 @@ jobs:
           foreach($file in $build.files){if((Get-FileHash (Join-Path $env:OFFICEFLOW_CANDIDATE $file.name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $file.sha256){throw 'Candidate checksum mismatch'}}
       - name: Test install over existing OfficeFlow
         shell: pwsh
-        run: ./ci/verify-installer.ps1 -Installer "$env:OFFICEFLOW_CANDIDATE/OfficeFlow-Setup-0.5.0.exe"
+        run: ./ci/verify-installer.ps1 -Installer "$env:OFFICEFLOW_CANDIDATE/OfficeFlow-Setup-0.5.1.exe"
       - name: Test app-specific start pages and new blank documents
         shell: pwsh
         run: node ci/verify-start-pages.cjs "$env:OFFICEFLOW_INSTALLED/collabora"
@@ -133,8 +135,8 @@ jobs:
       - name: Record verified release checksums
         shell: pwsh
         run: |
-          $setup=Join-Path $env:OFFICEFLOW_CANDIDATE 'OfficeFlow-Setup-0.5.0.exe'
-          $source=Join-Path $env:OFFICEFLOW_CANDIDATE 'OfficeFlow-0.5.0-source.zip'
+          $setup=Join-Path $env:OFFICEFLOW_CANDIDATE 'OfficeFlow-Setup-0.5.1.exe'
+          $source=Join-Path $env:OFFICEFLOW_CANDIDATE 'OfficeFlow-0.5.1-source.zip'
           $sum=Join-Path $env:OFFICEFLOW_CANDIDATE 'SHA256SUMS.txt'
           @($setup,$source) | ForEach-Object { (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant()+'  '+(Split-Path $_ -Leaf) } | Set-Content $sum -Encoding utf8NoBOM
       - name: Retain the verified installer and matching source
