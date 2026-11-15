@@ -12,12 +12,12 @@ const root=process.argv[2];
    else await page.getByText('PDFFlow',{exact:true}).first().waitFor();
    if(kind==='mail'){
     await page.evaluate(()=>window.officeflow.settings({mailStartWithWindows:true}));
-    assert.equal(await app.evaluate(({app})=>app.getLoginItemSettings({path:require('node:path').join(require('node:path').dirname(process.execPath),'MailFlow.exe'),args:['--background']}).openAtLogin),true);
+    assert.equal(await app.evaluate(({app})=>app.getLoginItemSettings({path:app.getPath('exe'),args:['--background']}).openAtLogin),true);
     await page.evaluate(()=>window.officeflow.settings({mailStartWithWindows:false}));
-    assert.equal(await app.evaluate(({app})=>app.getLoginItemSettings({path:require('node:path').join(require('node:path').dirname(process.execPath),'MailFlow.exe'),args:['--background']}).openAtLogin),false);
+    assert.equal(await app.evaluate(({app})=>app.getLoginItemSettings({path:app.getPath('exe'),args:['--background']}).openAtLogin),false);
     await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].close());
     assert.equal(await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].isVisible()),false);
-    await app.evaluate(({app})=>app.emit('second-instance',{},[process.execPath]));
+    await app.evaluate(({app})=>app.emit('second-instance',{},[app.getPath('exe')]));
     assert.equal(await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].isVisible()),true);
     assert.equal(await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().length),1);
     console.log('MailFlow tray close, Start-menu reopen, single window and Windows startup toggle PASS');
@@ -30,7 +30,7 @@ const root=process.argv[2];
  try{
   await quiet.evaluate(async({app,ipcMain})=>{await app.whenReady();for(let i=0;i<100&&!ipcMain._invokeHandlers.has('mailIndex');i++)await new Promise(r=>setTimeout(r,100));if(!ipcMain._invokeHandlers.has('mailIndex'))throw Error('Mail startup did not finish');});
   assert.equal(await quiet.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows().filter(w=>w.isVisible()).length),0);
-  await quiet.evaluate(({app})=>app.emit('second-instance',{},[process.execPath]));
+  await quiet.evaluate(({app})=>app.emit('second-instance',{},[app.getPath('exe')]));
   const page=await quiet.firstWindow();await page.getByRole('button',{name:'New message',exact:true}).waitFor();
   assert.equal(await quiet.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].isVisible()),true);
   console.log('MailFlow quiet startup and reopen PASS');
