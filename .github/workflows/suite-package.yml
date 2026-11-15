@@ -52,10 +52,10 @@ jobs:
         with:
           key: officeflow-suite-v2-${{ steps.native.outputs.id }}-${{ hashFiles('integration/**', 'collabora/branding/**', '!integration/**/__pycache__/**') }}
           # Exact 0.5.1 candidate, built before the cache-key normalization.
-          restore-keys: officeflow-suite-v2-43141296679-3beb5b93cb8ac3c4af5c71717aa8b3be5fb137a9f6e596869cf88a1d99bb6ec8
+          restore-keys: ${{ hashFiles('integration/**', 'collabora/branding/**', '!integration/**/__pycache__/**') == 'a70df9c39dce29e0e63d4695a3c89b0374e59725b5b9b30eee61c5ded84a8367' && 'officeflow-suite-v2-43141296679-3beb5b93cb8ac3c4af5c71717aa8b3be5fb137a9f6e596869cf88a1d99bb6ec8' || '' }}
           path: ${{ env.OFFICEFLOW_CANDIDATE }}
       - uses: actions/download-artifact@v4
-        if: steps.bundle.outputs.cache-hit != 'true'
+        if: steps.bundle.outputs.cache-matched-key == ''
         with:
           name: officeflow-native-development
           path: native-payload
@@ -66,14 +66,14 @@ jobs:
       - name: Install test client
         run: npm install --no-save --package-lock=false playwright@1.65.0 fflate@0.8.3
       - name: Verify source-built native editors
-        if: steps.bundle.outputs.cache-hit != 'true'
+        if: steps.bundle.outputs.cache-matched-key == ''
         run: node ci/verify-native.cjs native-payload --rich
       - name: Obtain checksum-pinned shared source
-        if: steps.bundle.outputs.cache-hit != 'true'
+        if: steps.bundle.outputs.cache-matched-key == ''
         shell: pwsh
         run: ./integration/fetch-shared.ps1
       - name: Prepare and build shared installer
-        if: steps.bundle.outputs.cache-hit != 'true'
+        if: steps.bundle.outputs.cache-matched-key == ''
         shell: pwsh
         run: |
           python integration/prepare-shared.py "$env:OFFICEFLOW_SHARED"
@@ -84,7 +84,7 @@ jobs:
           node integration/build-suite.mjs "$env:OFFICEFLOW_SHARED" "$env:GITHUB_WORKSPACE/native-payload"
           if($LASTEXITCODE -ne 0){throw 'Installer build failed'}
       - name: Retain the exact installer and corresponding source for validation retries
-        if: steps.bundle.outputs.cache-hit != 'true'
+        if: steps.bundle.outputs.cache-matched-key == ''
         shell: pwsh
         run: |
           python integration/package-source.py "$env:OFFICEFLOW_SHARED"
@@ -95,7 +95,7 @@ jobs:
           $files=@('OfficeFlow-Setup-0.5.1.exe','OfficeFlow-0.5.1-source.zip') | ForEach-Object { @{name=$_;sha256=(Get-FileHash (Join-Path $env:OFFICEFLOW_CANDIDATE $_) -Algorithm SHA256).Hash.ToLowerInvariant()} }
           @{commit=(git rev-parse HEAD);nativeRun='${{ steps.native.outputs.id }}';files=@($files)} | ConvertTo-Json -Depth 5 | Set-Content "$env:OFFICEFLOW_CANDIDATE/build.json" -Encoding utf8NoBOM
       - name: Cache the built candidate before installation checks
-        if: steps.bundle.outputs.cache-hit != 'true'
+        if: steps.bundle.outputs.cache-matched-key == ''
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
