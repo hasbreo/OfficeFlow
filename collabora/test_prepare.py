@@ -9,11 +9,11 @@ class NativeIdentityPatch(unittest.TestCase):
         original = (root / 'upstream-reference/CODA.cpp').read_text()
         patched = module.patch_identity(original)
         self.assertEqual(patched, module.patch_identity(patched))
-        for name in ['WordFlow', 'CellFlow', 'SlideFlow']:
+        for name in ['HasWord', 'HasCell', 'HasSlides']:
             self.assertIn('officeFlowAppName = "' + name + '";', patched)
         self.assertIn(' + " - " + officeFlowAppName', patched)
-        # Native profile isolation remains upstream's appName-based path.
-        self.assertIn('L"\\\\" + appName', patched)
+        # Native profiles retain their pre-rebrand locations.
+        self.assertIn('L"\\\\" + legacyProfile', patched)
         self.assertIn('createDocumentView(tab.tabId)', patched)
 
     def test_changed_upstream_fails_closed(self):

@@ -50,10 +50,10 @@ if [[ "$phase" == engine ]]; then exit 0; fi
 cd "$build_dir"
 test -s .officeflow-engine-complete
 # The cached engine is complete; only configure/build the browser and native hosts.
-make -o engine CONFIG=Release APP_NAME=OfficeFlow VENDOR=Hasbreo INFO_URL=https://hasbreo.com/officeflow/ ONLINE_CONFIGURE_ARGS="--with-app-branding=$repo/collabora/branding" 2>&1 | tee build.log
+make -o engine CONFIG=Release APP_NAME=HasOffice VENDOR=Hasbreo INFO_URL=https://hasbreo.com/hasoffice/ ONLINE_CONFIGURE_ARGS="--with-app-branding=$repo/collabora/branding" 2>&1 | tee build.log
 native="$build_dir/online/windows/coda/x64/Release/program"
-test -s "$native/OfficeFlow.exe"
-for app in WordFlow CellFlow SlideFlow; do cp "$native/OfficeFlow.exe" "$native/$app.exe"; done
+test -s "$native/HasOffice.exe"
+for app in HasWord HasCell HasSlides; do cp "$native/HasOffice.exe" "$native/$app.exe"; done
 mkdir -p "$native/../templates"
 cp "$repo/collabora/templates/"* "$native/../templates/"
 echo 'Native development build completed. Installer and release validation are separate gates.'

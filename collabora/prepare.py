@@ -18,16 +18,18 @@ def patch_identity(text):
     text = text.replace('Util::string_to_wide_string(APP_NAME)',
                         'Util::string_to_wide_string(officeFlowAppName)')
     text = text.replace(declaration, declaration + '\n' + marker +
-                        '\nstatic std::string officeFlowAppName = "OfficeFlow";')
+                        '\nstatic std::string officeFlowAppName = "HasOffice";')
     text = text.replace('    appName = Util::string_to_wide_string(officeFlowAppName);', '''    // Each executable has its own taskbar identity, profile and native titles.
     const auto officeFlowExecutable = std::filesystem::path(fileName).stem().wstring();
-    if (_wcsicmp(officeFlowExecutable.c_str(), L"WordFlow") == 0)
-        officeFlowAppName = "WordFlow";
-    else if (_wcsicmp(officeFlowExecutable.c_str(), L"CellFlow") == 0)
-        officeFlowAppName = "CellFlow";
-    else if (_wcsicmp(officeFlowExecutable.c_str(), L"SlideFlow") == 0)
-        officeFlowAppName = "SlideFlow";
+    if (_wcsicmp(officeFlowExecutable.c_str(), L"HasWord") == 0 || _wcsicmp(officeFlowExecutable.c_str(), L"WordFlow") == 0)
+        officeFlowAppName = "HasWord";
+    else if (_wcsicmp(officeFlowExecutable.c_str(), L"HasCell") == 0 || _wcsicmp(officeFlowExecutable.c_str(), L"CellFlow") == 0)
+        officeFlowAppName = "HasCell";
+    else if (_wcsicmp(officeFlowExecutable.c_str(), L"HasSlides") == 0 || _wcsicmp(officeFlowExecutable.c_str(), L"SlideFlow") == 0)
+        officeFlowAppName = "HasSlides";
     appName = Util::string_to_wide_string(officeFlowAppName);''')
+    text = text.replace('localAppData = Util::wide_string_to_string(std::wstring(appDataFolder) + L"\\\\" + appName);',
+                        'const std::wstring legacyProfile = officeFlowAppName == "HasWord" ? L"WordFlow" : officeFlowAppName == "HasCell" ? L"CellFlow" : officeFlowAppName == "HasSlides" ? L"SlideFlow" : L"OfficeFlow";\n    localAppData = Util::wide_string_to_string(std::wstring(appDataFolder) + L"\\\\" + legacyProfile);')
     return text
 
 def prepare(checkout):
@@ -89,7 +91,7 @@ def patch_native_ui(text):
                 raise ValueError('Upstream blank document template changed')
             native = native.replace(needle, replacement)
     if '// OfficeFlow signed update bridge' not in native:
-        declaration = 'static std::string officeFlowAppName = "OfficeFlow";'
+        declaration = 'static std::string officeFlowAppName = "HasOffice";'
         native = native.replace(declaration, declaration + '\nstatic void launchOfficeFlowUpdater(bool startup);')
         entry = 'int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int showWindowMode)'
         if native.count(entry) != 1:
@@ -98,20 +100,20 @@ def patch_native_ui(text):
 static void launchOfficeFlowUpdater(bool startup)
 {
     const auto helper = (std::filesystem::path(Util::string_to_wide_string(app_installation_path)) /
-                         L".." / L".." / L"OfficeFlowUpdater.exe").lexically_normal();
+                         L".." / L".." / L"HasOfficeUpdater.exe").lexically_normal();
     if (!std::filesystem::exists(helper))
     {
         if (!startup)
             MessageBoxW(nullptr, L"The updater is not included in this development build.",
-                        L"OfficeFlow Updates", MB_OK | MB_ICONINFORMATION);
+                        L"HasOffice Updates", MB_OK | MB_ICONINFORMATION);
         return;
     }
     const wchar_t* flags = startup ? L"--update-helper --startup" : L"--update-helper";
     const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(
         nullptr, L"open", helper.c_str(), flags, helper.parent_path().c_str(), SW_SHOWNORMAL));
     if (result <= 32 && !startup)
-        MessageBoxW(nullptr, L"Unable to start the OfficeFlow updater.",
-                    L"OfficeFlow Updates", MB_OK | MB_ICONERROR);
+        MessageBoxW(nullptr, L"Unable to start the HasOffice updater.",
+                    L"HasOffice Updates", MB_OK | MB_ICONERROR);
 }
 
 '''
@@ -140,7 +142,7 @@ def patch_backstage(text):
     text = text.replace(anchor, anchor + '''
     // OfficeFlow keeps each application on its own document family.
     private readonly officeFlowType: TemplateType | null =
-        ({WordFlow: 'writer', CellFlow: 'calc', SlideFlow: 'impress'} as Record<string, TemplateType>)[
+        ({HasWord: 'writer', HasCell: 'calc', HasSlides: 'impress'} as Record<string, TemplateType>)[
             new URLSearchParams(window.location.search).get('officeflowApp') || ''
         ] || null;
 ''')
