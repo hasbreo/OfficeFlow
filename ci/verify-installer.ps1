@@ -35,6 +35,8 @@ if((Get-ItemProperty $runKey).HasMail -notlike '*HasMail.exe*--background*'){thr
 if((Get-ItemProperty $runKey -Name MailFlow -ErrorAction SilentlyContinue)){throw 'Legacy duplicate startup entry remains'}
 if(Test-Path (Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs/OfficeFlow')){throw 'Old Start menu group remains'}
 foreach($oldName in @('WordFlow','CellFlow','SlideFlow','MailFlow','PDFFlow')){if(-not(Test-Path (Join-Path $root ($oldName+'.exe')))){throw 'Legacy shortcut target was removed'}}
+$iconHashes=@('hasword','hascell','hasslides','hasmail','haspdf') | ForEach-Object {(Get-FileHash (Join-Path $root ('resources/icons/'+$_+'.ico')) -Algorithm SHA256).Hash}
+if(@($iconHashes | Select-Object -Unique).Count -ne 5){throw 'Application icons are not distinct'}
 if((Get-FileHash $sentinel -Algorithm SHA256).Hash -ne $hash){throw 'Upgrade changed local mail'}
 "OFFICEFLOW_INSTALLED=$root" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 "OFFICEFLOW_SENTINEL=$sentinel" | Out-File $env:GITHUB_ENV -Append -Encoding utf8

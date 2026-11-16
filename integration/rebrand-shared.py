@@ -12,7 +12,7 @@ def apply(root):
             if p.name=='launch.cjs':
                 text=text.replace('const executableKinds={',"const executableKinds={hasword:'word',hascell:'cell',hasslides:'slide',hasmail:'mail',haspdf:'pdf',")
             # Preserve the existing backup subfolder so subsequent backups stay together.
-            text=text.replace('HasOffice-Mail','OfficeFlow-Mail')
+            text=text.replace('HasOffice-Mail','OfficeFlow-Mail').replace('../assets/mailflow.ico','../assets/hasmail.ico')
             p.write_text(text)
     for old,new in NAMES.items():
         for suffix in ['.png','.ico']:
