@@ -1,13 +1,13 @@
-# OfficeFlow
+# HasOffice
 
 Five independent Windows applications with one installer and signed updates:
-WordFlow, CellFlow, SlideFlow, MailFlow and PDFFlow.
+HasWord, HasCell, HasSlides, HasMail and HasPDF.
 
 The document apps use the full local Collabora / LibreOffice engine and tabbed
-interface, with OfficeFlow branding. MailFlow and PDFFlow keep the existing
+interface, with HasOffice branding. HasMail and HasPDF keep the existing
 shared application and its user data. No document server is required.
 
-Downloads and release notes: https://hasbreo.com/officeflow/
+Downloads and release notes: https://hasbreo.com/hasoffice/
 
 ## Build and release
 
@@ -23,9 +23,11 @@ Downloads and release notes: https://hasbreo.com/officeflow/
 See [native build instructions](collabora/BUILD.md),
 [verification gates](collabora/STATUS.md) and [component licensing](LICENSING.md).
 The official preview package is used only as an isolated test fixture; it is
-not included in the OfficeFlow release.
+not included in the HasOffice release.
 
 Shared application source is obtained from the checksum-pinned existing source
 distribution. No user mail, profiles or private release-signing keys belong in
 this repository. Microsoft Office's exact layout and advanced feature behaviour
-can differ; OfficeFlow does not promise perfect compatibility.
+can differ; HasOffice does not promise perfect compatibility.
+
+HasOffice succeeds OfficeFlow. Existing profile directories, updater trust and legacy executable aliases are intentionally retained for seamless upgrades. Each app now has its own icon and colour.

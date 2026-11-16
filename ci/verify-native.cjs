@@ -84,7 +84,7 @@ async function close(child){
     const archive=unzipSync(await fs.readFile(doc)),parts=Object.keys(archive),xml=await readPart(doc,part);
     if(name==='HasWord'){
      assert(xml.includes('<w:tbl>'),'Document table was lost');assert(parts.some(p=>p.startsWith('word/media/')),'Document image was lost');
-     assert(parts.filter(p=>/^word\/header\d+\.xml$/.test(p)).some(p=>strFromU8(archive[p]).includes('HasOffice fixture header')),'Header was lost');
+     assert(parts.filter(p=>/^word\/header\d+\.xml$/.test(p)).some(p=>strFromU8(archive[p]).includes('OfficeFlow fixture header')),'Header was lost');
     }else if(name==='HasCell'){
      assert(/<v>17<\/v>/.test(xml)&&/<v>24<\/v>/.test(xml),'Cross-sheet formulas did not calculate');
      assert(parts.some(p=>/^xl\/charts\/chart\d+\.xml$/.test(p)),'Workbook chart was lost');
