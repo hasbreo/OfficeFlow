@@ -18,6 +18,8 @@ window.addEventListener('load', function () {
   function attachIdentity() {
     var logo = document.querySelector('#document-header > a');
     if (!logo) return false;
+    var iconName = {HasWord:'hasword',HasCell:'hascell',HasSlides:'hasslides'}[brandProductName] || 'hasoffice';
+    document.querySelectorAll('.document-logo, #product-logo, .img-coda-app-logo, #document-header > a').forEach(function(el){if(el.tagName==='IMG')el.src=iconName+'.svg';else el.style.setProperty('background-image', 'url('+iconName+'.svg)', 'important');});
     logo.setAttribute('data-cooltip', brandProductName);
     logo.setAttribute('aria-label', brandProductName + ' website');
     logo.setAttribute('href', brandProductURL);

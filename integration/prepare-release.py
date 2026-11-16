@@ -10,11 +10,11 @@ def describe(path,kind,version):
             size+=len(chunk);sha.update(chunk);parts.append({'size':len(chunk),'sha256':hashlib.sha256(chunk).hexdigest()})
     return {'filename':path.name,'size':size,'sha256':sha.hexdigest(),'type':'application/zip' if kind=='source' else 'application/vnd.microsoft.portable-executable','parts':parts}
 def prepare(installer,source,key,site,output):
-    version='0.5.1'
-    assert installer.name==f'OfficeFlow-Setup-{version}.exe' and source.name==f'OfficeFlow-{version}-source.zip'
+    version='0.5.2'
+    assert installer.name==f'HasOffice-Setup-{version}.exe' and source.name==f'HasOffice-{version}-source.zip'
     files={k:describe(p,k,version) for k,p in [('installer',installer),('source',source)]}
     assert 0<files['installer']['size']<=1024**3,'Installer exceeds the existing updater limit'
-    manifest={'version':version,'url':'https://hasbreo.com/downloads/officeflow/'+installer.name,'sha256':files['installer']['sha256'],'size':files['installer']['size'],'notes':'WordFlow, CellFlow and SlideFlow now use the full local Collabora desktop engine. Independent native apps, mint theme, Office file editing, PDF export, bundled printing runtime and shared signed updates. MailFlow and PDFFlow keep their existing data.'}
+    manifest={'version':version,'url':'https://hasbreo.com/downloads/hasoffice/'+installer.name,'sha256':files['installer']['sha256'],'size':files['installer']['size'],'notes':'OfficeFlow is now HasOffice: HasWord, HasCell, HasSlides, HasMail and HasPDF. Fresh individual icons and colours, renamed shortcuts and app windows, with existing files, mail archives, settings and updates preserved.'}
     private=load_pem_private_key(key.read_bytes(),password=None)
     assert isinstance(private,Ed25519PrivateKey)
     raw=json.dumps(manifest,separators=(',',':'),ensure_ascii=False).encode()

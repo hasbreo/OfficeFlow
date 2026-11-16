@@ -50,6 +50,8 @@ for(const filename of ['branding.js','branding-app.js'])
 // Keep the final theme in sync without rebuilding the C++ engine for CSS changes.
 for(const filename of ['branding.css','branding-officeflow.svg'])
  await fs.copyFile(path.join(integration,'../collabora/branding',filename),path.join(payload,'collabora/cool',filename));
+for(const name of ['hasword','hascell','hasslides','hasmail','haspdf','hasoffice'])await fs.copyFile(path.join(integration,'icons',name+'.svg'),path.join(payload,'collabora/cool',name+'.svg'));
+await fs.copyFile(path.join(integration,'icons/hasoffice.svg'),path.join(payload,'collabora/cool/branding-officeflow.svg'));
 // These commercial vendor agreement templates do not describe our source-built distribution.
 // Keep LICENSE.html, NOTICE and all component copyright/licence notices.
 for(const filename of ['EULA.odt','EULA_en-US.rtf'])

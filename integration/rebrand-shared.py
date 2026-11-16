@@ -18,6 +18,10 @@ def apply(root):
         for suffix in ['.png','.ico']:
             source=root/'assets'/(old.lower()+suffix)
             if source.exists():shutil.copyfile(source,root/'assets'/(new.lower()+suffix))
+    for icon in (Path(__file__).parent/'icons').glob('*'):
+        if icon.suffix in {'.ico','.png'}:shutil.copyfile(icon,root/'assets'/icon.name)
+    for suffix in ['.ico','.png']:
+        shutil.copyfile(Path(__file__).parent/'icons'/('hasoffice'+suffix),root/'assets'/('officeflow'+suffix))
     import json
     p=root/'package.json';data=json.loads(p.read_text());data['productName']='HasOffice';data['build']['productName']='HasOffice';data['build']['nsis']['artifactName']='HasOffice-Setup-${version}.exe';
     for association in data['build'].get('fileAssociations',[]):
