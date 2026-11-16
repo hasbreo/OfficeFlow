@@ -1,0 +1,39 @@
+File
+Home
+Insert
+Layout
+References
+Review
+Format
+Form
+AI Assistant
+View
+Help
+Document name
+Editing
+Paste
+Clipboard
+Font
+Paragraph
+Styles
+Insert
+Search
+HasOffice saved document test
+Properties
+Style
+Paragraph Style
+Character
+Font Name
+Font Size
+Paragraph
+Spacing:
+Above:
+Below:
+Line Spacing:
+Indent:
+Before:
+After:
+First:
+Edit mode
+60
+Saved
