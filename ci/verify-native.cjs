@@ -1,10 +1,10 @@
-// Run against OfficeFlow's actual source-built native hosts and OOXML templates.
+// Run against HasOffice's actual source-built native hosts and OOXML templates.
 const {chromium}=require('playwright'),{spawn,spawnSync}=require('node:child_process');
 const fs=require('node:fs/promises'),path=require('node:path'),assert=require('node:assert/strict');
 const {unzipSync,strFromU8}=require('fflate');
 const root=path.resolve(process.argv[2]),out=path.resolve('probe-results');
 const upstream=process.argv.includes('--upstream-fixture'),rich=process.argv.includes('--rich');
-const fixtures=[['WordFlow','TextDocument.docx','text','word/document.xml'],['CellFlow','Spreadsheet.xlsx','spreadsheet','xl/worksheets/sheet1.xml'],['SlideFlow','Presentation.pptx','presentation','ppt/presentation.xml']];
+const fixtures=[['HasWord','TextDocument.docx','text','word/document.xml'],['HasCell','Spreadsheet.xlsx','spreadsheet','xl/worksheets/sheet1.xml'],['HasSlides','Presentation.pptx','presentation','ppt/presentation.xml']];
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function readPart(file,part){return strFromU8(unzipSync(await fs.readFile(file))[part]);}
 async function connect(child,port){
@@ -46,8 +46,8 @@ async function close(child){
    await page.evaluate(()=>{app.map.uiManager.setDocTypePref('onboardingTourSeen',true);app.onboardingTour?.end();});
    console.log(name+' core readiness',await page.evaluate(()=>({editDoc:app.map.stateChangeHandler.getItemValue('EditDoc'),save:app.map.stateChangeHandler.getItemValue('Save'),modified:app.file.modified})));
    const before=await readPart(doc,part);
-   if(name==='WordFlow'){await page.evaluate(()=>app.map.focus());await page.keyboard.type('OfficeFlow saved document test');}
-   else if(name==='CellFlow'){
+   if(name==='HasWord'){await page.evaluate(()=>app.map.focus());await page.keyboard.type('HasOffice saved document test');}
+   else if(name==='HasCell'){
     for(const[cell,value]of[['A1','8'],['B1','=A1*2']]){
      await page.evaluate(cell=>app.map.sendUnoCommand('.uno:GoToCell',{ToPoint:{type:'string',value:cell}}),cell);
      // UNO navigation and Enter are asynchronous in the native engine. Wait for
@@ -75,24 +75,24 @@ async function close(child){
    while(Date.now()<until){
     try{const xml=await readPart(doc,part);
      const b1=xml.match(/<c\b[^>]*\br="B1"[^>]*>[\s\S]*?<\/c>/)?.[0]||'';
-     good=name==='WordFlow'?xml.includes('OfficeFlow saved document test'):name==='CellFlow'?/<f[^>]*>A1\*2<\/f>/.test(b1)&&/<v>16<\/v>/.test(b1):(xml.match(/<p:sldId\s/g)||[]).length>(before.match(/<p:sldId\s/g)||[]).length;
+     good=name==='HasWord'?xml.includes('HasOffice saved document test'):name==='HasCell'?/<f[^>]*>A1\*2<\/f>/.test(b1)&&/<v>16<\/v>/.test(b1):(xml.match(/<p:sldId\s/g)||[]).length>(before.match(/<p:sldId\s/g)||[]).length;
      if(good)break;
     }catch{}await pause(300);
    }
    assert(good,name+' content did not survive native OOXML save');
    if(rich){
     const archive=unzipSync(await fs.readFile(doc)),parts=Object.keys(archive),xml=await readPart(doc,part);
-    if(name==='WordFlow'){
+    if(name==='HasWord'){
      assert(xml.includes('<w:tbl>'),'Document table was lost');assert(parts.some(p=>p.startsWith('word/media/')),'Document image was lost');
-     assert(parts.filter(p=>/^word\/header\d+\.xml$/.test(p)).some(p=>strFromU8(archive[p]).includes('OfficeFlow fixture header')),'Header was lost');
-    }else if(name==='CellFlow'){
+     assert(parts.filter(p=>/^word\/header\d+\.xml$/.test(p)).some(p=>strFromU8(archive[p]).includes('HasOffice fixture header')),'Header was lost');
+    }else if(name==='HasCell'){
      assert(/<v>17<\/v>/.test(xml)&&/<v>24<\/v>/.test(xml),'Cross-sheet formulas did not calculate');
      assert(parts.some(p=>/^xl\/charts\/chart\d+\.xml$/.test(p)),'Workbook chart was lost');
     }else assert(parts.some(p=>p.startsWith('ppt/media/')),'Slide image was lost');
    }
    const pdf=path.join(out,name+'-export.pdf');await fs.rm(pdf,{force:true});
    const picker=spawn('powershell.exe',['-NoProfile','-NonInteractive','-File',path.join(__dirname,'save-native-pdf.ps1'),'-ProcessId',String(child.pid),'-Destination',pdf],{stdio:'inherit'});
-   await page.evaluate(()=>window.postMobileMessage('downloadas name=OfficeFlow.pdf id=export format=pdf options='));
+   await page.evaluate(()=>window.postMobileMessage('downloadas name=HasOffice.pdf id=export format=pdf options='));
    const pdfUntil=Date.now()+60000;let pdfBytes;
    while(Date.now()<pdfUntil){try{pdfBytes=await fs.readFile(pdf);if(pdfBytes.length>1000&&pdfBytes.subarray(0,5).toString()==='%PDF-')break;}catch{}await pause(300);}
    assert(pdfBytes&&pdfBytes.length>1000&&pdfBytes.subarray(0,5).toString()==='%PDF-',name+' native PDF export failed');

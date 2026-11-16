@@ -31,6 +31,7 @@ def prepare(root):
 
     import importlib.util
     spec=importlib.util.spec_from_file_location('mail_tray',here/'mail-tray.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);module.apply(root)
+    spec=importlib.util.spec_from_file_location('rebrand_shared',here/'rebrand-shared.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);module.apply(root)
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('source',type=Path);a=p.parse_args();prepare(a.source.resolve())

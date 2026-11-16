@@ -3,7 +3,7 @@ const {chromium}=require('playwright'),{spawn,spawnSync}=require('node:child_pro
 const fs=require('node:fs/promises'),path=require('node:path'),assert=require('node:assert/strict');
 const root=path.resolve(process.argv[2]),out=path.resolve('probe-results');
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
-const apps=[['WordFlow','Blank Document','text','.docx'],['CellFlow','Blank Spreadsheet','spreadsheet','.xlsx'],['SlideFlow','Blank Presentation','presentation','.pptx']];
+const apps=[['HasWord','Blank Document','text','.docx'],['HasCell','Blank Spreadsheet','spreadsheet','.xlsx'],['HasSlides','Blank Presentation','presentation','.pptx']];
 (async()=>{
  await fs.mkdir(out,{recursive:true});
  for(let i=0;i<apps.length;i++){

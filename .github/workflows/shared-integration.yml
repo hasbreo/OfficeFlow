@@ -23,7 +23,7 @@ jobs:
           node --test integration/shared/*.test.cjs
           node --check "$env:OFFICEFLOW_SHARED/desktop/main.cjs"
           node --check "$env:OFFICEFLOW_SHARED/desktop/legacy-main.cjs"
-      - name: Build MailFlow and PDFFlow frontend
+      - name: Build HasMail and HasPDF frontend
         shell: pwsh
         run: |
           Set-Location $env:OFFICEFLOW_SHARED
@@ -31,15 +31,15 @@ jobs:
           if($LASTEXITCODE -ne 0){throw 'Dependency installation failed'}
           npm run build
           if($LASTEXITCODE -ne 0){throw 'Shared app build failed'}
-      - name: Verify packaged MailFlow, PDFFlow and updater startup
+      - name: Verify packaged HasMail, HasPDF and updater startup
         shell: pwsh
         run: |
           Set-Location $env:OFFICEFLOW_SHARED
           npx electron-builder --win dir --x64 --config.directories.output=release-smoke
           if($LASTEXITCODE -ne 0){throw 'Shared runtime packaging failed'}
-          node scripts/build-app-identities.mjs release-smoke/win-unpacked
+          node "$env:GITHUB_WORKSPACE/integration/build-shared-identities.mjs" release-smoke/win-unpacked
           if($LASTEXITCODE -ne 0){throw 'Windows identity preparation failed'}
-          Copy-Item release-smoke/win-unpacked/OfficeFlow.exe release-smoke/win-unpacked/OfficeFlowUpdater.exe
+          Copy-Item release-smoke/win-unpacked/HasOffice.exe release-smoke/win-unpacked/HasOfficeUpdater.exe
           $payload=Join-Path $env:OFFICEFLOW_SHARED 'release-smoke/win-unpacked'
           Set-Location $env:GITHUB_WORKSPACE
           npm install --no-save --package-lock=false playwright@1.65.0
@@ -47,7 +47,7 @@ jobs:
           Set-Content "$env:APPDATA/officeflow/settings.json" '{"autoUpdates":false,"theme":"dark"}' -Encoding utf8NoBOM
           node ci/verify-shared.cjs "$payload"
           if($LASTEXITCODE -ne 0){throw 'Packaged app startup failed'}
-          $p=Start-Process -FilePath "$payload/OfficeFlowUpdater.exe" -ArgumentList '--update-helper','--startup' -PassThru
+          $p=Start-Process -FilePath "$payload/HasOfficeUpdater.exe" -ArgumentList '--update-helper','--startup' -PassThru
           if(-not $p.WaitForExit(15000)){$p.Kill();throw 'Updater did not exit after disabled startup check'}
           if($p.ExitCode -ne 0){throw 'Updater startup failed'}
       - name: Retain shared app test screenshots

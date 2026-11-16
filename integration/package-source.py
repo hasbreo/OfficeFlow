@@ -4,7 +4,7 @@ from zipfile import ZipFile, ZIP_DEFLATED
 import sys, json, subprocess
 shared=Path(sys.argv[1]).resolve(); repo=Path(__file__).resolve().parent.parent
 version=json.loads((shared/'package.json').read_text())['version']
-output=shared.parent/f'OfficeFlow-{version}-source.zip'
+output=shared.parent/f'HasOffice-{version}-source.zip'
 def excluded(relative):
     return any(p in {'node_modules','.git','dist','test-results','playwright-report','__pycache__','build-deps'} or p.startswith('release') for p in relative.parts) or relative.suffix in {'.pem','.key'}
 with ZipFile(output,'w',ZIP_DEFLATED) as archive:

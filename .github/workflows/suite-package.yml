@@ -51,8 +51,6 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           key: officeflow-suite-v2-${{ steps.native.outputs.id }}-${{ hashFiles('integration/**', 'collabora/branding/**', '!integration/**/__pycache__/**') }}
-          # Exact 0.5.1 candidate, built before the cache-key normalization.
-          restore-keys: ${{ hashFiles('integration/**', 'collabora/branding/**', '!integration/**/__pycache__/**') == 'a70df9c39dce29e0e63d4695a3c89b0374e59725b5b9b30eee61c5ded84a8367' && 'officeflow-suite-v2-43141296679-3beb5b93cb8ac3c4af5c71717aa8b3be5fb137a9f6e596869cf88a1d99bb6ec8' || '' }}
           path: ${{ env.OFFICEFLOW_CANDIDATE }}
       - uses: actions/download-artifact@v4
         if: steps.bundle.outputs.cache-matched-key == ''
@@ -90,9 +88,9 @@ jobs:
           python integration/package-source.py "$env:OFFICEFLOW_SHARED"
           if($LASTEXITCODE -ne 0){throw 'Source packaging failed'}
           New-Item -ItemType Directory -Force $env:OFFICEFLOW_CANDIDATE | Out-Null
-          Copy-Item "$env:OFFICEFLOW_SHARED/release-0.5/OfficeFlow-Setup-0.5.1.exe" $env:OFFICEFLOW_CANDIDATE
-          Copy-Item "$env:RUNNER_TEMP/officeflow-shared/OfficeFlow-0.5.1-source.zip" $env:OFFICEFLOW_CANDIDATE
-          $files=@('OfficeFlow-Setup-0.5.1.exe','OfficeFlow-0.5.1-source.zip') | ForEach-Object { @{name=$_;sha256=(Get-FileHash (Join-Path $env:OFFICEFLOW_CANDIDATE $_) -Algorithm SHA256).Hash.ToLowerInvariant()} }
+          Copy-Item "$env:OFFICEFLOW_SHARED/release-0.5/HasOffice-Setup-0.5.2.exe" $env:OFFICEFLOW_CANDIDATE
+          Copy-Item "$env:RUNNER_TEMP/officeflow-shared/HasOffice-0.5.2-source.zip" $env:OFFICEFLOW_CANDIDATE
+          $files=@('HasOffice-Setup-0.5.2.exe','HasOffice-0.5.2-source.zip') | ForEach-Object { @{name=$_;sha256=(Get-FileHash (Join-Path $env:OFFICEFLOW_CANDIDATE $_) -Algorithm SHA256).Hash.ToLowerInvariant()} }
           @{commit=(git rev-parse HEAD);nativeRun='${{ steps.native.outputs.id }}';files=@($files)} | ConvertTo-Json -Depth 5 | Set-Content "$env:OFFICEFLOW_CANDIDATE/build.json" -Encoding utf8NoBOM
       - name: Cache the built candidate before installation checks
         if: steps.bundle.outputs.cache-matched-key == ''
@@ -109,7 +107,7 @@ jobs:
           foreach($file in $build.files){if((Get-FileHash (Join-Path $env:OFFICEFLOW_CANDIDATE $file.name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $file.sha256){throw 'Candidate checksum mismatch'}}
       - name: Test install over existing OfficeFlow
         shell: pwsh
-        run: ./ci/verify-installer.ps1 -Installer "$env:OFFICEFLOW_CANDIDATE/OfficeFlow-Setup-0.5.1.exe"
+        run: ./ci/verify-installer.ps1 -Installer "$env:OFFICEFLOW_CANDIDATE/HasOffice-Setup-0.5.2.exe"
       - name: Test app-specific start pages and new blank documents
         shell: pwsh
         run: node ci/verify-start-pages.cjs "$env:OFFICEFLOW_INSTALLED/collabora"
@@ -137,8 +135,8 @@ jobs:
       - name: Record verified release checksums
         shell: pwsh
         run: |
-          $setup=Join-Path $env:OFFICEFLOW_CANDIDATE 'OfficeFlow-Setup-0.5.1.exe'
-          $source=Join-Path $env:OFFICEFLOW_CANDIDATE 'OfficeFlow-0.5.1-source.zip'
+          $setup=Join-Path $env:OFFICEFLOW_CANDIDATE 'HasOffice-Setup-0.5.2.exe'
+          $source=Join-Path $env:OFFICEFLOW_CANDIDATE 'HasOffice-0.5.2-source.zip'
           $sum=Join-Path $env:OFFICEFLOW_CANDIDATE 'SHA256SUMS.txt'
           @($setup,$source) | ForEach-Object { (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant()+'  '+(Split-Path $_ -Leaf) } | Set-Content $sum -Encoding utf8NoBOM
       - name: Retain the verified installer and matching source

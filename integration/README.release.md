@@ -34,4 +34,4 @@ HasMail continues to use the publisher's registered Google desktop client. Googl
 
 ## Source and licences
 
-Shared HasMail/HasPDF application source and the native build recipe are included in the source distribution. The exact Collabora source revision and native modifications are published at https://github.com/hasbreo/HasOffice. Component notices and licences are retained. The shared application is AGPL-3.0-or-later; Collabora's modified native source retains MPL-2.0 notices. Private signing keys are excluded.
+Shared HasMail/HasPDF application source and the native build recipe are included in the source distribution. The exact Collabora source revision and native modifications are published at https://github.com/hasbreo/OfficeFlow. Component notices and licences are retained. The shared application is AGPL-3.0-or-later; Collabora's modified native source retains MPL-2.0 notices. Private signing keys are excluded.
